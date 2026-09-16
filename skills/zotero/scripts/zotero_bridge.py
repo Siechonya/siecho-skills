@@ -594,11 +594,17 @@ def sha256_file(path, chunk_size=1 << 20):
     return digest.hexdigest()
 
 
-def provenance_index():
-    """Map PDF sha256 -> recorded MinerU output, over every output directory."""
-    index = {}
+def provenance_records():
+    """Every readable `.mineru-provenance.json` under MINERU_DIR.
+
+    A record is evidence, not an answer: the markdown it names may have been deleted or
+    moved, and the conversion it came from may have been graded fail. Each record
+    therefore carries `markdownExists` and the recorded `qualityStatus`, and callers
+    decide what that is worth.
+    """
+    records = []
     if not MINERU_DIR or not os.path.isdir(MINERU_DIR):
-        return index
+        return records
     for entry in os.scandir(MINERU_DIR):
         if not entry.is_dir():
             continue
@@ -610,18 +616,32 @@ def provenance_index():
                 record = json.load(handle)
         except (OSError, ValueError):
             continue
-        digest = (record.get("pdf") or {}).get("sha256")
+        pdf_block = record.get("pdf") or {}
+        markdown_block = record.get("markdown") or {}
+        digest = pdf_block.get("sha256")
         if not digest:
             continue
-        markdown_name = (record.get("markdown") or {}).get("file")
-        index[digest] = {
+        markdown_name = markdown_block.get("file")
+        markdown_path = os.path.join(entry.path, markdown_name) if markdown_name else None
+        records.append({
             "directory": entry.path,
             "dirname": entry.name,
-            "markdownFile": os.path.join(entry.path, markdown_name) if markdown_name else None,
+            "sha256": digest,
+            "markdownFile": markdown_path,
+            "markdownExists": bool(markdown_path) and os.path.isfile(markdown_path),
+            "qualityStatus": markdown_block.get("qualityStatus"),
+            "pdfPath": pdf_block.get("path"),
+            "pdfFilename": pdf_block.get("filename"),
+            "pdfSizeBytes": pdf_block.get("sizeBytes"),
             "provenance": record_path,
-            "pdf": (record.get("pdf") or {}).get("path"),
-        }
-    return index
+            "adopted": bool(record.get("adopted")),
+        })
+    return records
+
+
+def provenance_index():
+    """Map PDF sha256 -> provenance record."""
+    return {record["sha256"]: record for record in provenance_records()}
 
 
 def cmd_get_attachments(item_id):
@@ -1166,33 +1186,118 @@ def cmd_mineru_find(item_id):
         if pdf_row['path']:
             pdf_filename = os.path.splitext(os.path.basename(str(pdf_row['path'])))[0]
 
-    exact = None
+    record = None
     if pdf_path and os.path.isfile(pdf_path):
-        exact = provenance_index().get(sha256_file(pdf_path))
+        record = provenance_index().get(sha256_file(pdf_path))
+
+    if record is None:
+        match = "none"
+    elif record["markdownExists"]:
+        match = "provenance"
+    else:
+        # The record survives its markdown. Reporting this as a match handed back a path
+        # that no longer exists.
+        match = "provenance-markdown-missing"
 
     result = {
         "itemID": item_id,
         "title": title,
         "year": year or None,
         "pdfPath": pdf_path,
-        "match": "provenance" if exact else "none",
-        "markdownPath": exact["markdownFile"] if exact else None,
+        "match": match,
+        "markdownPath": record["markdownFile"] if match == "provenance" else None,
+        "markdownExists": bool(record and record["markdownExists"]),
+        # The grade recorded when the markdown was produced, not a fresh check.
+        "qualityStatus": record["qualityStatus"] if record else None,
+        "provenance": {
+            "file": record["provenance"],
+            "directory": record["directory"],
+            "adopted": record["adopted"],
+        } if record else None,
         "candidates": rank_mineru_candidates(title, year, pdf_filename),
         "mineruDir": MINERU_DIR,
     }
-    if not exact:
+    if match == "provenance-markdown-missing":
+        result["note"] = (
+            "A provenance record for this PDF exists but the markdown it names is missing "
+            "(" + str(record["markdownFile"]) + "). It is deliberately NOT reported as a "
+            "match. Re-convert the PDF, or re-record the directory that holds it with "
+            "`mineru-adopt <itemID> <dirname>`."
+        )
+    elif match == "none":
         result["note"] = (
             "No provenance record matched this PDF, so `candidates` are heuristic "
             "directory-name guesses and must be confirmed as the right paper before any "
             "of them is quoted. Converting through mineru_create_md.py records provenance; "
             "`mineru-adopt <itemID> <dirname>` records it for an existing directory."
         )
+    if match == "provenance" and record["qualityStatus"] == "fail":
+        result["qualityWarning"] = (
+            "The recorded conversion was graded fail, so treat this markdown as unusable "
+            "until re-inspected."
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     conn.close()
 
 
+def _library_pdf_attachments(cursor, research_types):
+    """Resolvable PDF attachments of research items, as {itemID, path, size}."""
+    placeholders = ','.join(['?'] * len(research_types))
+    cursor.execute(f"""
+        SELECT ia.parentItemID AS itemID, ia.path AS path, i.key AS attachmentKey
+        FROM itemAttachments ia
+        JOIN items i ON i.itemID = ia.itemID
+        JOIN items parent ON parent.itemID = ia.parentItemID
+        JOIN itemTypes it ON parent.itemTypeID = it.itemTypeID
+        WHERE ia.contentType = 'application/pdf'
+          AND it.typeName IN ({placeholders})
+    """, research_types)
+    attachments = []
+    for row in cursor.fetchall():
+        resolved = resolve_attachment_path(row['path'], row['attachmentKey'])
+        if not resolved:
+            continue
+        try:
+            size = os.path.getsize(resolved)
+        except OSError:
+            continue
+        attachments.append({
+            "itemID": row['itemID'],
+            "attachmentKey": row['attachmentKey'],
+            "path": resolved,
+            "size": size,
+        })
+    return attachments
+
+
+def associate_record_with_library(record, attachments):
+    """Find the library attachment whose file is the one this record describes.
+
+    Size filters first so only plausible candidates are opened and hashed; hashing the
+    whole library would make a listing cost far more than it needs to.
+    """
+    digest = record.get("sha256")
+    if not digest:
+        return None
+    recorded_size = record.get("pdfSizeBytes")
+    for attachment in attachments:
+        if recorded_size is not None and attachment["size"] != recorded_size:
+            continue
+        try:
+            if sha256_file(attachment["path"]) == digest:
+                return attachment
+        except OSError:
+            continue
+    return None
+
+
 def cmd_mineru_list():
-    """List MinerU output directories, split by how they were matched."""
+    """List MinerU output directories, split by how firmly each is tied to this library.
+
+    `matched` means the recorded PDF was found in the current library (a bare provenance
+    file is not enough). Records that cannot be tied to a library item, or whose markdown
+    is gone, are reported under `unlinked` instead of being counted as matches.
+    """
     conn = get_db()
     cursor = conn.cursor()
 
@@ -1218,9 +1323,11 @@ def cmd_mineru_list():
             "year": str(fields.get('date', ''))[:4] if fields.get('date') else '',
         })
 
-    by_dirname = {hit["dirname"]: hit for hit in provenance_index().values()}
+    attachments = _library_pdf_attachments(cursor, RESEARCH_TYPES)
+    records_by_dirname = {record["dirname"]: record for record in provenance_records()}
 
     matched = []
+    unlinked = []
     candidates = []
     unmatched = []
 
@@ -1229,14 +1336,36 @@ def cmd_mineru_list():
             continue
         dirname = entry.name
 
-        if dirname in by_dirname:
-            hit = by_dirname[dirname]
-            matched.append({
-                "dirname": dirname,
-                "path": entry.path,
-                "markdownFile": hit["markdownFile"],
-                "match": "provenance",
-            })
+        record = records_by_dirname.get(dirname)
+        if record is not None:
+            attachment = associate_record_with_library(record, attachments)
+            if attachment is None:
+                unlinked.append({
+                    "dirname": dirname,
+                    "path": entry.path,
+                    "sha256": record["sha256"],
+                    "markdownExists": record["markdownExists"],
+                    "qualityStatus": record["qualityStatus"],
+                    "reason": "no PDF in this library matches the recorded hash",
+                })
+            elif not record["markdownExists"]:
+                unlinked.append({
+                    "dirname": dirname,
+                    "path": entry.path,
+                    "itemID": attachment["itemID"],
+                    "markdownFile": record["markdownFile"],
+                    "qualityStatus": record["qualityStatus"],
+                    "reason": "provenance record found but its markdown is missing",
+                })
+            else:
+                matched.append({
+                    "dirname": dirname,
+                    "path": entry.path,
+                    "itemID": attachment["itemID"],
+                    "markdownFile": record["markdownFile"],
+                    "qualityStatus": record["qualityStatus"],
+                    "adopted": record["adopted"],
+                })
             continue
 
         best_id, best_score, best_reasons = None, 0, []
@@ -1258,16 +1387,19 @@ def cmd_mineru_list():
 
     print(json.dumps({
         "matched": matched,
+        "unlinked": unlinked,
         "candidates": candidates,
         "unmatched": unmatched,
-        "totalMineru": len(matched) + len(candidates) + len(unmatched),
+        "totalMineru": len(matched) + len(unlinked) + len(candidates) + len(unmatched),
         "matchedCount": len(matched),
+        "unlinkedCount": len(unlinked),
         "candidateCount": len(candidates),
         "unmatchedCount": len(unmatched),
         "note": (
-            "`matched` comes from recorded provenance. `candidates` are heuristic "
-            "directory-name matches (score >= " + str(MATCH_MIN_SCORE) + "); confirm each one "
-            "before treating it as the paper's markdown."
+            "`matched` = provenance record whose PDF hash is present in THIS library "
+            "(itemID included). `unlinked` = provenance exists but no library PDF matches "
+            "it, or its markdown is gone; inspect before trusting. `candidates` are "
+            "directory-name guesses only (score >= " + str(MATCH_MIN_SCORE) + ")."
         ),
     }, ensure_ascii=False, indent=2))
     conn.close()

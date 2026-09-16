@@ -100,9 +100,13 @@ python "<SKILL_DIR>/scripts/mineru_create_md.py" --batch "<directory-of-pdfs>" -
 ```
 
 `--pattern "**/*.pdf"` recurses. Batch mode is deliberately sequential — exactly one MinerU
-process per PDF — so concurrent jobs cannot contend for GPU memory. Output is a JSON
-summary with per-file `pass`, `warn`, `fail`, or `error`. It stops at the first failure
-unless `--continue-on-error` is set.
+process per PDF — so concurrent jobs cannot contend for GPU memory. Output is a JSON summary
+with per-file `pass`, `warn`, `fail`, or `error`, plus `stoppedEarly`.
+
+A `fail` **quality verdict does not stop the batch**: the conversion ran, the output is merely
+judged unusable. Only an **error** (a conversion that could not run) stops it, unless
+`--continue-on-error` is set. Either way the exit code is 0 only when nothing errored and
+nothing was graded `fail`.
 
 Quality verdicts, read literally: `pass` means none of the checks found a problem — not that
 formulas, tables and page completeness were verified. `warn` means inspect `sampleBadContexts`
@@ -112,11 +116,33 @@ before relying on it. `fail` means do not use it; rerun with a different `--meth
 
 `mineru-find` is exact by default: it hashes the paper's PDF and looks for a
 `.mineru-provenance.json` written by `mineru_create_md.py`, so the answer is the markdown that
-came from that file. Markdown converted before provenance existed has none, so it is reported
-under `candidates` instead — ranked by directory-name similarity — and must be confirmed by
-reading it before anything from it is quoted. Record an existing directory explicitly with
+came from that file.
+
+A record is **verified before it is reported**: `match: "provenance"` only when the markdown
+still exists. If the record survives but its markdown is gone you get
+`match: "provenance-markdown-missing"` and `markdownPath: null` — never a path that no longer
+resolves. The response also carries `markdownExists` and `qualityStatus`, the grade recorded
+when the markdown was produced (it is not re-checked at lookup time), and a `qualityWarning`
+when that recorded grade was `fail`.
+
+Markdown converted before provenance existed has no record, so it is reported under
+`candidates` instead — ranked by directory-name similarity — and must be confirmed by reading
+it before anything from it is quoted. Record an existing directory explicitly with
 `mineru-adopt <itemID> <dirname>`, which is the point where a human asserts the pairing.
 A shared year is deliberately not enough to count as a match.
+
+`mineru-list` uses the same records in the other direction, and is strict about what `matched`
+means:
+
+| Bucket | Meaning |
+| --- | --- |
+| `matched` | a provenance record whose PDF hash was found among **this library's** attachments; includes its `itemID` |
+| `unlinked` | provenance exists, but no library PDF matches it, or its markdown is gone |
+| `candidates` | name-similarity guess only, with a score; not verified |
+| `unmatched` | nothing to match it to |
+
+A provenance file on its own is not a match: with an empty library, everything with a record
+lands in `unlinked`, not `matched`.
 
 ### How MinerU is invoked (and what you must provide)
 

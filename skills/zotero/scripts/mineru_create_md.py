@@ -258,7 +258,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--check-md", type=Path, help="Only quality-check an existing markdown file")
     parser.add_argument("--batch", type=Path, help="Batch convert all PDFs in a directory")
     parser.add_argument("--pattern", default="*.pdf", help="Glob pattern for --batch (default: *.pdf)")
-    parser.add_argument("--continue-on-error", action="store_true", help="Continue batch even if one PDF fails")
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help=("Keep going after a conversion error instead of stopping the batch. A 'fail' "
+              "quality verdict does not stop the batch either way; it is recorded per file."),
+    )
     parser.add_argument("--method", choices=["auto", "txt", "ocr"], default="auto")
     parser.add_argument("--paper-name", help="Output folder name under docs/mineru_output")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -336,7 +341,13 @@ def batch_convert(args: argparse.Namespace) -> int:
         return 1
 
     results = []
-    summary = {"total": len(pdf_files), "pass": 0, "warn": 0, "fail": 0, "error": 0, "results": results}
+    summary = {
+        "total": len(pdf_files), "pass": 0, "warn": 0, "fail": 0, "error": 0,
+        # True when an error aborted the run early, so a caller can tell a truncated
+        # batch from a complete one.
+        "stoppedEarly": False,
+        "results": results,
+    }
 
     for i, pdf_path in enumerate(pdf_files, 1):
         print(f"\r[{i}/{len(pdf_files)}] {pdf_path.name}...", file=sys.stderr, end="", flush=True)
@@ -356,6 +367,7 @@ def batch_convert(args: argparse.Namespace) -> int:
             results.append({"pdf": str(pdf_path), "status": "error", "error": str(exc)})
             summary["error"] += 1
             if not args.continue_on_error:
+                summary["stoppedEarly"] = True
                 print(file=sys.stderr)  # newline after progress
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
                 return 1

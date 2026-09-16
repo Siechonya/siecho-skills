@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -48,9 +49,14 @@ class QualityVerdictTests(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             return mineru.quality_check(path)["status"]
 
-    def test_short_and_mojibake_stays_fail(self):
-        # 101 characters carrying a replacement character: too short *and* mojibake.
-        # This used to come back "warn" because the mojibake branch overwrote "fail".
+    def test_short_document_with_mild_mojibake_stays_fail(self):
+        # 101 characters, one U+00C3 mojibake rune, below the 2% mojibake ratio.
+        # The old code marked this "fail" for being short, then a later branch set
+        # "warn" unconditionally, downgrading it. A pure U+FFFD sample does NOT catch
+        # that: it trips the replacement-character branch, so both versions say "fail".
+        self.assertEqual(self.verdict("a " * 50 + "\u00c3"), "fail")
+
+    def test_replacement_characters_fail(self):
         self.assertEqual(self.verdict("\ufffd" * 101), "fail")
 
     def test_tiny_document_fails(self):
@@ -286,12 +292,23 @@ class SyncScriptKeepTests(unittest.TestCase):
                 (folder / "SKILL.md").write_text(
                     f"---\nname: {name}\ndescription: test\n---\n\nbody\n", encoding="utf-8")
 
-            # the agent's own private skill, with unique content
-            private = root / "cc-web"
-            private.mkdir(parents=True)
-            (private / "SKILL.md").write_text(
+            # The agent's private skill, as a LINK to somewhere else. A plain directory
+            # is protected by the script's real-directory guard, so it would not exercise
+            # the bug: the old create/repoint loop saw any *link* with a name present in
+            # the canonical set and repointed it, silently replacing the private skill.
+            elsewhere = tmp_path / "elsewhere" / "cc-web"
+            elsewhere.mkdir(parents=True)
+            (elsewhere / "SKILL.md").write_text(
                 "---\nname: cc-web\ndescription: PRIVATE, do not touch\n---\n\nprivate\n",
                 encoding="utf-8")
+            root.mkdir(parents=True, exist_ok=True)
+            private = root / "cc-web"
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(private), str(elsewhere)],
+                capture_output=True, text=True,
+            )
+            if made.returncode != 0:
+                self.skipTest("could not create a junction: " + made.stderr.strip())
 
             config = (
                 f"$Canonical = '{canonical}'\n"
@@ -311,10 +328,11 @@ class SyncScriptKeepTests(unittest.TestCase):
             )
             output = (completed.stdout or "") + (completed.stderr or "")
 
-            # the private directory survives as a real directory with its content
-            self.assertTrue(private.is_dir())
-            entry = os.lstat(private)
-            self.assertFalse(os.path.islink(private), "private dir was replaced by a link")
+            # the private link still points where it did, with its content intact
+            self.assertEqual(
+                os.path.realpath(private), os.path.realpath(elsewhere),
+                "the private junction was repointed at the canonical skill",
+            )
             self.assertIn("PRIVATE, do not touch",
                           (private / "SKILL.md").read_text(encoding="utf-8"))
 
@@ -322,3 +340,232 @@ class SyncScriptKeepTests(unittest.TestCase):
             linked = root / "alpha"
             self.assertTrue(linked.exists(), "canonical skill was not linked; script output:\n" + output)
             self.assertIn("collides with a private Keep entry", output)
+
+def build_library(db_path, papers):
+    """Create a minimal Zotero-shaped SQLite file.
+
+    Only the tables the bridge actually reads for lookups and listings: enough for
+    get_item_fields, the attachment query, and the research-item scan.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+        CREATE TABLE items (itemID INTEGER PRIMARY KEY, itemTypeID INTEGER, key TEXT);
+        CREATE TABLE itemAttachments (itemID INTEGER, parentItemID INTEGER,
+                                      contentType TEXT, path TEXT);
+        CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+        CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+        INSERT INTO itemTypes (itemTypeID, typeName) VALUES (1, 'journalArticle'), (2, 'attachment');
+        INSERT INTO fields (fieldID, fieldName) VALUES (1, 'title'), (2, 'date');
+        """
+    )
+    value_id = 0
+    for paper in papers:
+        conn.execute("INSERT INTO items (itemID, itemTypeID, key) VALUES (?, 1, ?)",
+                     (paper["itemID"], paper["key"]))
+        for field_id, value in ((1, paper["title"]), (2, paper.get("date", ""))):
+            value_id += 1
+            conn.execute("INSERT INTO itemDataValues (valueID, value) VALUES (?, ?)",
+                         (value_id, value))
+            conn.execute("INSERT INTO itemData (itemID, fieldID, valueID) VALUES (?, ?, ?)",
+                         (paper["itemID"], field_id, value_id))
+        for index, attachment in enumerate(paper.get("attachments", []), start=1):
+            # An attachment is an item in its own right: its key names the storage
+            # folder, and the bridge joins itemAttachments to items to read it.
+            attachment_item_id = 1000 + paper["itemID"] * 10 + index
+            conn.execute(
+                "INSERT INTO items (itemID, itemTypeID, key) VALUES (?, 2, ?)",
+                (attachment_item_id, "ATTKEY%03d" % index),
+            )
+            conn.execute(
+                "INSERT INTO itemAttachments (itemID, parentItemID, contentType, path) "
+                "VALUES (?, ?, 'application/pdf', ?)",
+                (attachment_item_id, paper["itemID"], attachment["path"]),
+            )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def write_provenance(directory, pdf_path, quality="pass", markdown_name="paper.md",
+                     markdown_present=True):
+    """Write a provenance record the way mineru_create_md.py would."""
+    directory.mkdir(parents=True, exist_ok=True)
+    digest = mineru.sha256_file(pdf_path)
+    if markdown_present:
+        (directory / markdown_name).write_text("body " * 80, encoding="utf-8")
+    record = {
+        "schema": 1,
+        "pdf": {
+            "path": str(pdf_path),
+            "filename": pdf_path.name,
+            "sizeBytes": pdf_path.stat().st_size,
+            "sha256": digest,
+        },
+        "markdown": {"file": markdown_name, "qualityStatus": quality},
+        "mineru": {"method": "auto", "backend": "pipeline", "condaEnv": None, "modelSource": None},
+    }
+    import json as _json
+    (directory / ".mineru-provenance.json").write_text(
+        _json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return record
+
+
+class ProvenanceRecordTests(unittest.TestCase):
+    """A provenance record is evidence about a file that may no longer be there."""
+
+    def setUp(self):
+        self._saved_mineru = bridge.MINERU_DIR
+        self._saved_db = bridge.DB_PATH
+        self._saved_storage = bridge.STORAGE_PATH
+
+    def tearDown(self):
+        bridge.MINERU_DIR = self._saved_mineru
+        bridge.DB_PATH = self._saved_db
+        bridge.STORAGE_PATH = self._saved_storage
+
+    def test_missing_markdown_is_recorded_not_hidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            pdf = tmp_path / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4 payload")
+            output = tmp_path / "mineru"
+            write_provenance(output / "paper", pdf, quality="fail", markdown_present=False)
+            bridge.MINERU_DIR = str(output)
+
+            records = bridge.provenance_records()
+            self.assertEqual(len(records), 1)
+            self.assertFalse(records[0]["markdownExists"])
+            self.assertEqual(records[0]["qualityStatus"], "fail")
+
+
+class MineruLookupTests(unittest.TestCase):
+    """cmd_mineru_find must not hand back a path that is gone, and must not guess."""
+
+    def setUp(self):
+        self._saved_mineru = bridge.MINERU_DIR
+        self._saved_db = bridge.DB_PATH
+        self._saved_storage = bridge.STORAGE_PATH
+
+    def tearDown(self):
+        bridge.MINERU_DIR = self._saved_mineru
+        bridge.DB_PATH = self._saved_db
+        bridge.STORAGE_PATH = self._saved_storage
+
+    def run_find(self, item_id):
+        buffer = io.StringIO()
+        real_stdout = sys.stdout
+        try:
+            sys.stdout = buffer
+            bridge.cmd_mineru_find(item_id)
+        finally:
+            sys.stdout = real_stdout
+        return json.loads(buffer.getvalue())
+
+    def setup_case(self, tmp_path, markdown_present):
+        pdf = tmp_path / "turbulent-flow.pdf"
+        pdf.write_bytes(b"%PDF-1.4 payload")
+        output = tmp_path / "mineru"
+        write_provenance(output / "turbulent-flow", pdf, quality="fail",
+                         markdown_present=markdown_present)
+        db = build_library(tmp_path / "zotero.sqlite", [
+            {"itemID": 1, "key": "ITEMKEY1",
+             "title": "Turbulent flow classification with wavelets", "date": "2021-03-01",
+             "attachments": [{"path": str(pdf)}]},
+        ])
+        bridge.MINERU_DIR = str(output)
+        bridge.DB_PATH = str(db)
+        bridge.STORAGE_PATH = None
+        return pdf
+
+    def test_deleted_markdown_is_not_reported_as_a_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            self.setup_case(tmp_path, markdown_present=False)
+            result = self.run_find(1)
+            self.assertEqual(result["match"], "provenance-markdown-missing")
+            self.assertIsNone(result["markdownPath"])
+            self.assertFalse(result["markdownExists"])
+            self.assertEqual(result["qualityStatus"], "fail")
+            self.assertIn("missing", result["note"])
+
+    def test_present_markdown_matches_and_carries_the_grade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            self.setup_case(tmp_path, markdown_present=True)
+            result = self.run_find(1)
+            self.assertEqual(result["match"], "provenance")
+            self.assertTrue(result["markdownExists"])
+            self.assertEqual(result["qualityStatus"], "fail")
+            self.assertTrue(os.path.isfile(result["markdownPath"]))
+            self.assertIn("qualityWarning", result)
+
+
+class MineruListTests(unittest.TestCase):
+    """`matched` must mean "tied to a PDF in THIS library", nothing weaker."""
+
+    def setUp(self):
+        self._saved_mineru = bridge.MINERU_DIR
+        self._saved_db = bridge.DB_PATH
+        self._saved_storage = bridge.STORAGE_PATH
+
+    def tearDown(self):
+        bridge.MINERU_DIR = self._saved_mineru
+        bridge.DB_PATH = self._saved_db
+        bridge.STORAGE_PATH = self._saved_storage
+
+    def run_list(self):
+        buffer = io.StringIO()
+        real_stdout = sys.stdout
+        try:
+            sys.stdout = buffer
+            bridge.cmd_mineru_list()
+        finally:
+            sys.stdout = real_stdout
+        return json.loads(buffer.getvalue())
+
+    def test_empty_library_yields_no_matches(self):
+        # The original bug: a provenance file alone counted as a match, so an empty
+        # library still reported matchedCount 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            pdf = tmp_path / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4 payload")
+            output = tmp_path / "mineru"
+            write_provenance(output / "paper", pdf, quality="pass")
+            db = build_library(tmp_path / "zotero.sqlite", [])
+
+            bridge.MINERU_DIR = str(output)
+            bridge.DB_PATH = str(db)
+            bridge.STORAGE_PATH = None
+
+            summary = self.run_list()
+            self.assertEqual(summary["matchedCount"], 0)
+            self.assertEqual(summary["unlinkedCount"], 1)
+            self.assertEqual(summary["unlinked"][0]["reason"],
+                             "no PDF in this library matches the recorded hash")
+            self.assertNotIn("itemID", summary["unlinked"][0])
+
+    def test_library_pdf_is_matched_with_its_item_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            pdf = tmp_path / "turbulent-flow.pdf"
+            pdf.write_bytes(b"%PDF-1.4 payload")
+            output = tmp_path / "mineru"
+            write_provenance(output / "turbulent-flow", pdf, quality="pass")
+            db = build_library(tmp_path / "zotero.sqlite", [
+                {"itemID": 7, "key": "ITEMKEY7", "title": "Turbulent flow classification",
+                 "date": "2021-01-01", "attachments": [{"path": str(pdf)}]},
+            ])
+
+            bridge.MINERU_DIR = str(output)
+            bridge.DB_PATH = str(db)
+            bridge.STORAGE_PATH = None
+
+            summary = self.run_list()
+            self.assertEqual(summary["matchedCount"], 1)
+            self.assertEqual(summary["unlinkedCount"], 0)
+            self.assertEqual(summary["matched"][0]["itemID"], 7)
+            self.assertTrue(os.path.isfile(summary["matched"][0]["markdownFile"]))

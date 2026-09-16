@@ -20,6 +20,9 @@ Search and read a local Zotero library, generate citations, and convert Zotero P
   attachment and PDF lookup, APA/BibTeX citations, structured export.
 - Converts PDFs to markdown via the **MinerU CLI** — single file or batch — and grades each
   result `pass` / `warn` / `fail` so bad OCR never gets summarized as if it were sound.
+- Lookups do not guess. Each conversion records the source PDF's SHA-256, and a markdown is
+  only reported as a match when that record exists **and** the file is still there; anything
+  else comes back separately as an unverified candidate or an unlinked record.
 - **Requires** a local Zotero library, Python 3, and a local MinerU installation. There is
   **no hosted-API path** in this skill. Paths come from environment variables
   (`ZOTERO_DB`, `ZOTERO_STORAGE`, `MINERU_OUTPUT_DIR`), and the MinerU call is configurable
@@ -67,9 +70,15 @@ python -m unittest discover -s tests -v     # stdlib only; no Zotero or MinerU r
 
 Covers the failure modes that have actually occurred: quality-verdict escalation, MinerU match
 scoring (a bare year must not match), `storage:` path resolution under the attachment key,
-provenance round-tripping, batch argument propagation, BibTeX author/entry-type handling, and
-the skill-sync script leaving a private skill alone when its name collides with the canonical
-set. Point the suite at another checkout with `ZOTERO_SCRIPTS_DIR` / `SYNC_SKILLS_SCRIPT`.
+batch argument propagation, BibTeX author/entry-type handling, and the skill-sync script
+leaving a private skill alone when its name collides with the canonical set. Provenance
+lookups and listings run against a minimal Zotero-shaped SQLite fixture, so the "a record is
+not a match" and "an empty library matches nothing" cases are exercised directly.
+
+Each of these tests was checked against the previous release: they fail on the code that still
+had the bug, rather than passing on both.
+
+Point the suite at another checkout with `ZOTERO_SCRIPTS_DIR` / `SYNC_SKILLS_SCRIPT`.
 
 ## Install
 

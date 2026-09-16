@@ -20,13 +20,16 @@ Usage:
   python zotero_bridge.py search-by-author "<name>"       # Search papers by author name
   python zotero_bridge.py list-tags                       # List all tags with counts
   python zotero_bridge.py mineru-find <itemID>            # Find MinerU markdown for a paper
-  python zotero_bridge.py mineru-list                     # List all MinerU outputs matched to papers
+  python zotero_bridge.py mineru-list                     # List MinerU outputs, split by match quality
+  python zotero_bridge.py mineru-adopt <itemID> <dirname> # Record provenance for existing markdown
 """
 
-import sqlite3
+import hashlib
 import json
-import sys
 import os
+import re
+import sqlite3
+import sys
 from datetime import datetime, timedelta
 
 # Force UTF-8 output to handle Unicode characters in paper titles
@@ -111,13 +114,31 @@ def find_zotero_storage():
 #   MINERU_OUTPUT_DIR   full path to the MinerU markdown output directory
 #   ZOTERO_VAULT_ROOT   library root; MinerU output defaults to <root>/docs/mineru_output
 DB_PATH = find_zotero_db() or os.environ.get("ZOTERO_DB")
-if not DB_PATH:
-    raise SystemExit(
-        "zotero.sqlite not found. Set ZOTERO_DB to its full path and retry; "
-        "see SKILL.md (Requirements) for the other optional variables."
-    )
 STORAGE_PATH = find_zotero_storage() or os.environ.get("ZOTERO_STORAGE")
 MINERU_DIR = find_mineru_dir() or os.environ.get("MINERU_OUTPUT_DIR")
+
+MISSING_DB_MESSAGE = (
+    "zotero.sqlite not found. Set ZOTERO_DB to its full path and retry; "
+    "see SKILL.md (Requirements) for the other optional variables."
+)
+
+
+def resolve_db_path():
+    """Locate the library at call time.
+
+    Kept out of import time on purpose: a missing library should fail the command
+    that needs it, not turn `import zotero_bridge` into a process exit.
+    """
+    global DB_PATH, STORAGE_PATH, MINERU_DIR
+    if not DB_PATH:
+        DB_PATH = find_zotero_db() or os.environ.get("ZOTERO_DB")
+    if not DB_PATH:
+        raise RuntimeError(MISSING_DB_MESSAGE)
+    if not STORAGE_PATH:
+        STORAGE_PATH = find_zotero_storage() or os.environ.get("ZOTERO_STORAGE")
+    if not MINERU_DIR:
+        MINERU_DIR = find_mineru_dir() or os.environ.get("MINERU_OUTPUT_DIR")
+    return DB_PATH
 
 # Field IDs from Zotero schema
 FIELDS = {
@@ -148,8 +169,22 @@ RESEARCH_TYPES = [
 
 def get_db():
     """Get a read-only database connection with row factory."""
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    path = resolve_db_path()
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=15.0)
     conn.row_factory = sqlite3.Row
+    try:
+        # Probe here: a library locked by a running Zotero fails at this point, which is
+        # the one place that can explain it, instead of SQLITE_BUSY surfacing from inside
+        # whichever command the caller ran.
+        conn.execute("SELECT 1 FROM itemTypes LIMIT 1").fetchone()
+    except sqlite3.OperationalError as error:
+        conn.close()
+        raise RuntimeError(
+            f"could not read the Zotero library at {path}: {error}. "
+            "Zotero keeps its library in a rollback-journal SQLite file, so a running "
+            "Zotero (or an unfinished sync) blocks readers. Close Zotero and retry, or "
+            "point ZOTERO_DB at a copy of the library."
+        ) from error
     return conn
 
 
@@ -454,31 +489,159 @@ def cmd_list_papers(collection_id=None, limit=20, offset=0):
     conn.close()
 
 
+# Matching weights for pairing a paper with a MinerU output directory. A bare
+# year match scores 1, deliberately below MATCH_MIN_SCORE: scoring a year as 3
+# against a threshold of 3 made any same-year directory "the" answer, which can
+# hand a model the wrong paper while looking successful.
+MATCH_MIN_SCORE = 6
+MATCH_TITLE_TOKEN_WEIGHT = 3
+MATCH_FILENAME_WEIGHT = 10
+MATCH_YEAR_WEIGHT = 1
+TITLE_TOKEN_MIN_LENGTH = 4
+TITLE_STOPWORDS = {
+    "with", "from", "that", "this", "these", "those", "into", "over", "under",
+    "using", "used", "based", "toward", "towards", "between", "through", "their",
+    "there", "when", "which", "while", "study", "analysis", "review", "effect",
+    "effects", "novel", "approach",
+}
+
+
+def resolve_attachment_path(path, attachment_key):
+    """Resolve one attachment row's `path` to a real filesystem path.
+
+    A Zotero `storage:name.pdf` value lives at <storage>/<attachment key>/name.pdf.
+    The flat <storage>/name.pdf layout only exists in very old libraries, so it is
+    tried second.
+    """
+    if not path:
+        return None
+    path = str(path)
+    if not path.startswith("storage:"):
+        return path if os.path.exists(path) else None
+
+    base = STORAGE_PATH or os.environ.get("ZOTERO_STORAGE")
+    if not base:
+        return None
+
+    rel_path = path.replace("storage:", "", 1).replace("\\", "/").lstrip("/")
+    candidates = []
+    if attachment_key:
+        candidates.append(os.path.join(base, attachment_key, rel_path))
+    candidates.append(os.path.join(base, rel_path))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def title_tokens(text):
+    """Lowercased content words of a title or directory name."""
+    words = re.split(r"[^0-9a-z]+", str(text or "").lower())
+    return {w for w in words if len(w) >= TITLE_TOKEN_MIN_LENGTH and w not in TITLE_STOPWORDS}
+
+
+def score_mineru_dir(dirname, paper_tokens, year, pdf_stem):
+    """Score one MinerU directory name against a paper. Returns (score, reasons)."""
+    reasons = []
+    score = 0
+
+    shared = set(paper_tokens) & title_tokens(dirname)
+    if shared:
+        score += MATCH_TITLE_TOKEN_WEIGHT * len(shared)
+        reasons.append("shares title token(s): " + ", ".join(sorted(shared)))
+
+    if pdf_stem and pdf_stem.lower() in dirname.lower():
+        score += MATCH_FILENAME_WEIGHT
+        reasons.append("PDF filename appears in the directory name")
+
+    if year and str(year) in dirname:
+        score += MATCH_YEAR_WEIGHT
+        reasons.append("year " + str(year) + " appears in the directory name")
+
+    return score, reasons
+
+
+def rank_mineru_candidates(title, year, pdf_stem, limit=5):
+    """Heuristic candidates for a paper, best first. Never authoritative."""
+    if not MINERU_DIR or not os.path.isdir(MINERU_DIR):
+        return []
+    paper_tokens = title_tokens(title)
+    ranked = []
+    for entry in os.scandir(MINERU_DIR):
+        if not entry.is_dir():
+            continue
+        score, reasons = score_mineru_dir(entry.name, paper_tokens, year, pdf_stem)
+        if score < MATCH_MIN_SCORE:
+            continue
+        md_files = [f.path for f in os.scandir(entry.path) if f.is_file() and f.name.endswith(".md")]
+        ranked.append({
+            "directory": entry.path,
+            "dirname": entry.name,
+            "markdownFile": md_files[0] if md_files else None,
+            "score": score,
+            "reasons": reasons,
+        })
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked[:limit]
+
+
+def sha256_file(path, chunk_size=1 << 20):
+    """Streaming SHA-256 of a file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def provenance_index():
+    """Map PDF sha256 -> recorded MinerU output, over every output directory."""
+    index = {}
+    if not MINERU_DIR or not os.path.isdir(MINERU_DIR):
+        return index
+    for entry in os.scandir(MINERU_DIR):
+        if not entry.is_dir():
+            continue
+        record_path = os.path.join(entry.path, ".mineru-provenance.json")
+        if not os.path.isfile(record_path):
+            continue
+        try:
+            with open(record_path, encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        digest = (record.get("pdf") or {}).get("sha256")
+        if not digest:
+            continue
+        markdown_name = (record.get("markdown") or {}).get("file")
+        index[digest] = {
+            "directory": entry.path,
+            "dirname": entry.name,
+            "markdownFile": os.path.join(entry.path, markdown_name) if markdown_name else None,
+            "provenance": record_path,
+            "pdf": (record.get("pdf") or {}).get("path"),
+        }
+    return index
+
+
 def cmd_get_attachments(item_id):
     """Get attachment paths for a paper."""
     conn = get_db()
     cursor = conn.cursor()
 
+    # The attachment's own item key names its storage folder, so it has to come
+    # back with the row.
     cursor.execute("""
-        SELECT itemID, parentItemID, linkMode, contentType, path, storageModTime
-        FROM itemAttachments WHERE parentItemID = ?
+        SELECT ia.itemID, ia.parentItemID, ia.linkMode, ia.contentType, ia.path,
+               ia.storageModTime, i.key AS attachmentKey
+        FROM itemAttachments ia
+        JOIN items i ON i.itemID = ia.itemID
+        WHERE ia.parentItemID = ?
     """, (item_id,))
     attachments = [dict(row) for row in cursor.fetchall()]
 
-    # Resolve storage: paths to actual filesystem paths
     for att in attachments:
-        if att['path'] and att['path'].startswith('storage:'):
-            rel_path = att['path'].replace('storage:', '')
-            base = STORAGE_PATH or os.environ.get("ZOTERO_STORAGE")
-            if not base:
-                att['resolvedPath'] = None
-                continue
-            full = os.path.join(base, rel_path)
-            att['resolvedPath'] = full if os.path.exists(full) else None
-        elif att['path']:
-            att['resolvedPath'] = att['path'] if os.path.exists(att['path']) else None
-        else:
-            att['resolvedPath'] = None
+        att['resolvedPath'] = resolve_attachment_path(att.get('path'), att.get('attachmentKey'))
 
     print(json.dumps({"itemID": item_id, "attachments": attachments}, ensure_ascii=False, indent=2))
     conn.close()
@@ -490,9 +653,10 @@ def cmd_find_pdf(item_id):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT itemID, path, contentType
-        FROM itemAttachments
-        WHERE parentItemID = ? AND contentType = 'application/pdf'
+        SELECT ia.itemID, ia.path, ia.contentType, i.key AS attachmentKey
+        FROM itemAttachments ia
+        JOIN items i ON i.itemID = ia.itemID
+        WHERE ia.parentItemID = ? AND ia.contentType = 'application/pdf'
         LIMIT 1
     """, (item_id,))
     row = cursor.fetchone()
@@ -500,20 +664,12 @@ def cmd_find_pdf(item_id):
     if not row:
         print(json.dumps({"itemID": item_id, "pdfPath": None, "error": "No PDF attachment found"}))
     else:
-        path = row['path']
-        if path and path.startswith('storage:'):
-            rel_path = path.replace('storage:', '')
-            base = STORAGE_PATH or os.environ.get("ZOTERO_STORAGE")
-            if not base:
-                path = None
-            else:
-                full = os.path.join(base, rel_path)
-                path = full if os.path.exists(full) else None
-
+        path = resolve_attachment_path(row['path'], row['attachmentKey'])
         print(json.dumps({
             "itemID": item_id,
             "pdfPath": path,
-            "exists": os.path.exists(path) if path else False
+            "attachmentKey": row['attachmentKey'],
+            "exists": bool(path) and os.path.exists(path)
         }, ensure_ascii=False, indent=2))
 
     conn.close()
@@ -663,8 +819,42 @@ def cmd_annotations(item_id):
     conn.close()
 
 
+BIBTEX_ENTRY_TYPES = {
+    "journalArticle": "article",
+    "conferencePaper": "inproceedings",
+    "book": "book",
+    "bookSection": "incollection",
+    "thesis": "phdthesis",
+    "report": "techreport",
+    "manuscript": "unpublished",
+}
+
+
+def format_bibtex_authors(creators):
+    """Full author list in BibTeX `and` form.
+
+    The display helper collapses to `A & B` / `A et al.`, which loses authors and
+    is not valid BibTeX. This keeps every author in order.
+    """
+    authors = [c for c in creators if c['type'] == 'author'] or creators
+    names = []
+    for author in sorted(authors, key=lambda item: item['order']):
+        last = (author['lastName'] or '').strip()
+        first = (author['firstName'] or '').strip()
+        if last:
+            names.append(f"{last}, {first}".rstrip(', '))
+        elif (author['name'] or '').strip():
+            names.append(author['name'].strip())
+    return " and ".join(names) if names else "Unknown"
+
+
 def cmd_cite(item_id):
-    """Generate a basic citation from metadata."""
+    """Generate a simplified citation draft.
+
+    This is a draft, not publication-grade output: entry type and the author list
+    are handled, but LaTeX-special characters are not escaped and the APA string is
+    informal. See the `warning` field in the response.
+    """
     conn = get_db()
     cursor = conn.cursor()
 
@@ -676,7 +866,7 @@ def cmd_cite(item_id):
 
     fields = get_item_fields(cursor, item_id, [
         'title', 'date', 'publicationTitle', 'volume', 'issue',
-        'pages', 'DOI', 'publisher', 'place', 'bookTitle'
+        'pages', 'DOI', 'publisher', 'place', 'bookTitle', 'citationKey'
     ])
     creators = get_creators(cursor, item_id)
 
@@ -689,7 +879,7 @@ def cmd_cite(item_id):
     pages = fields.get('pages', '')
     doi = fields.get('DOI', '')
 
-    # Build APA-ish citation
+    # Informal APA-ish string, for reading only.
     citation = f"{authors} ({year}). {title}."
     if journal:
         citation += f" *{journal}*"
@@ -703,18 +893,41 @@ def cmd_cite(item_id):
     if doi:
         citation += f" https://doi.org/{doi}"
 
+    entry_type = BIBTEX_ENTRY_TYPES.get(item_type, "misc")
+    container = journal or fields.get('bookTitle', '')
+    container_field = "journal" if item_type == "journalArticle" else (
+        "booktitle" if item_type == "bookSection" else "howpublished")
+    key = fields.get('citationKey') or f"item_{item_id}"
+
+    lines = [
+        f"@{entry_type}{{{key},",
+        f"  author = {{{format_bibtex_authors(creators)}}},",
+        f"  title = {{{title}}},",
+        f"  year = {{{year}}},",
+    ]
+    if container:
+        lines.append(f"  {container_field} = {{{container}}},")
+    for name, value in (
+        ("volume", volume), ("number", issue), ("pages", pages),
+        ("publisher", fields.get('publisher', '')), ("doi", doi),
+    ):
+        if value:
+            lines.append(f"  {name} = {{{value}}},")
+    lines.append("}")
+
     result = {
         "itemID": item_id,
+        "itemType": item_type,
+        "draft": True,
         "citation": citation,
         "apa": citation,
-        "bibtex": f"@article{{{fields.get('citationKey', f'item_{item_id}')},\n"
-                  f"  author = {{{authors}}},\n"
-                  f"  title = {{{title}}},\n"
-                  f"  journal = {{{journal}}},\n"
-                  f"  year = {{{year}}},\n"
-                  f"  volume = {{{volume}}},\n"
-                  f"  pages = {{{pages}}},\n"
-                  f"  doi = {{{doi}}}\n}}"
+        "bibtex": "\n".join(lines),
+        "warning": (
+            "Simplified citation draft. Entry type is mapped from the Zotero item type and "
+            "the author list is complete, but LaTeX-special characters are NOT escaped, the "
+            "APA string is informal rather than APA 7, and no CSL style is applied. Verify "
+            "against the target venue's requirements before using it in a submission."
+        ),
     }
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -918,79 +1131,68 @@ def cmd_search_by_author(name):
 
 
 def cmd_mineru_find(item_id):
-    """Find MinerU markdown output for a paper."""
+    """Find MinerU markdown output for a paper.
+
+    Exact match only: the PDF's SHA-256 must equal the one recorded in a
+    `.mineru-provenance.json` written by mineru_create_md.py (or by mineru-adopt).
+    Directory-name guessing is reported separately as `candidates`, because a bare
+    year match used to be enough to return an unrelated paper as the answer.
+    """
     conn = get_db()
     cursor = conn.cursor()
 
-    # Get paper title to match against MinerU directories
     fields = get_item_fields(cursor, item_id, ['title', 'date'])
     title = fields.get('title', '')
     year = str(fields.get('date', ''))[:4] if fields.get('date') else ''
 
     if not MINERU_DIR or not os.path.isdir(MINERU_DIR):
-        print(json.dumps({"itemID": item_id, "mineruPath": None, "error": "MinerU output directory not found"}))
+        print(json.dumps({"itemID": item_id, "markdownPath": None, "error": "MinerU output directory not found"}))
         conn.close()
         return
 
-    # Get attachment PDF filename for matching
     cursor.execute("""
-        SELECT path FROM itemAttachments
-        WHERE parentItemID = ? AND contentType = 'application/pdf'
+        SELECT ia.path, i.key AS attachmentKey
+        FROM itemAttachments ia
+        JOIN items i ON i.itemID = ia.itemID
+        WHERE ia.parentItemID = ? AND ia.contentType = 'application/pdf'
         LIMIT 1
     """, (item_id,))
     pdf_row = cursor.fetchone()
+
+    pdf_path = None
     pdf_filename = ''
-    if pdf_row and pdf_row['path']:
-        pdf_filename = os.path.splitext(os.path.basename(pdf_row['path']))[0]
+    if pdf_row:
+        pdf_path = resolve_attachment_path(pdf_row['path'], pdf_row['attachmentKey'])
+        if pdf_row['path']:
+            pdf_filename = os.path.splitext(os.path.basename(str(pdf_row['path'])))[0]
 
-    # Search MinerU directories for matches
-    best_match = None
-    best_score = 0
-
-    for entry in os.scandir(MINERU_DIR):
-        if not entry.is_dir():
-            continue
-        dirname = entry.name
-        score = 0
-
-        # Score by year match
-        if year and year in dirname:
-            score += 3
-
-        # Score by PDF filename match (author-year pattern)
-        if pdf_filename and pdf_filename.lower() in dirname.lower():
-            score += 10
-
-        # Score by title word overlap
-        title_words = set(title.lower().split()[:10])  # first 10 title words
-        dir_words = set(dirname.lower().replace('_', ' ').replace('-', ' ').split())
-        overlap = title_words & dir_words
-        score += len(overlap) * 2
-
-        if score > best_score:
-            best_score = score
-            # Find the actual .md file
-            md_files = [f.path for f in os.scandir(entry.path) if f.is_file() and f.name.endswith('.md')]
-            best_match = {
-                "directory": entry.path,
-                "dirname": dirname,
-                "mdFile": md_files[0] if md_files else None,
-                "score": score
-            }
+    exact = None
+    if pdf_path and os.path.isfile(pdf_path):
+        exact = provenance_index().get(sha256_file(pdf_path))
 
     result = {
         "itemID": item_id,
         "title": title,
-        "mineruMatch": best_match if best_match and best_score >= 3 else None,
-        "mineruDir": MINERU_DIR
+        "year": year or None,
+        "pdfPath": pdf_path,
+        "match": "provenance" if exact else "none",
+        "markdownPath": exact["markdownFile"] if exact else None,
+        "candidates": rank_mineru_candidates(title, year, pdf_filename),
+        "mineruDir": MINERU_DIR,
     }
-
+    if not exact:
+        result["note"] = (
+            "No provenance record matched this PDF, so `candidates` are heuristic "
+            "directory-name guesses and must be confirmed as the right paper before any "
+            "of them is quoted. Converting through mineru_create_md.py records provenance; "
+            "`mineru-adopt <itemID> <dirname>` records it for an existing directory."
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     conn.close()
 
 
 def cmd_mineru_list():
-    """List all MinerU output directories with paper matching."""
+    """List MinerU output directories, split by how they were matched."""
     conn = get_db()
     cursor = conn.cursor()
 
@@ -999,7 +1201,6 @@ def cmd_mineru_list():
         conn.close()
         return
 
-    # Get all papers with their titles and years
     cursor.execute(f"""
         SELECT i.itemID FROM items i
         JOIN itemTypes it ON i.itemTypeID = it.itemTypeID
@@ -1007,57 +1208,130 @@ def cmd_mineru_list():
     """, RESEARCH_TYPES)
     all_items = [row['itemID'] for row in cursor.fetchall()]
 
-    # Build a lookup: title_words → itemID for matching
     paper_index = []
     for item_id in all_items:
         fields = get_item_fields(cursor, item_id, ['title', 'date'])
-        title = (fields.get('title') or '').lower()
-        year = str(fields.get('date', ''))[:4] if fields.get('date') else ''
         paper_index.append({
             "itemID": item_id,
-            "title": title,
-            "year": year,
-            "titleWords": set(title.split()[:15])
+            "title": fields.get('title') or '',
+            "tokens": title_tokens(fields.get('title') or ''),
+            "year": str(fields.get('date', ''))[:4] if fields.get('date') else '',
         })
 
-    results = []
+    by_dirname = {hit["dirname"]: hit for hit in provenance_index().values()}
+
+    matched = []
+    candidates = []
     unmatched = []
 
     for entry in os.scandir(MINERU_DIR):
         if not entry.is_dir():
             continue
         dirname = entry.name
-        dirname_lower = dirname.lower()
 
-        # Find best matching paper
-        best_id = None
-        best_score = 0
-        for p in paper_index:
-            score = 0
-            if p['year'] and p['year'] in dirname:
-                score += 3
-            overlap = p['titleWords'] & set(dirname_lower.replace('_', ' ').replace('-', ' ').split())
-            score += len(overlap) * 2
-            if score > best_score:
-                best_score = score
-                best_id = p['itemID']
-
-        if best_score >= 3:
-            results.append({
+        if dirname in by_dirname:
+            hit = by_dirname[dirname]
+            matched.append({
                 "dirname": dirname,
+                "path": entry.path,
+                "markdownFile": hit["markdownFile"],
+                "match": "provenance",
+            })
+            continue
+
+        best_id, best_score, best_reasons = None, 0, []
+        for paper in paper_index:
+            score, reasons = score_mineru_dir(dirname, paper["tokens"], paper["year"], None)
+            if score > best_score:
+                best_id, best_score, best_reasons = paper["itemID"], score, reasons
+
+        if best_score >= MATCH_MIN_SCORE:
+            candidates.append({
+                "dirname": dirname,
+                "path": entry.path,
                 "itemID": best_id,
                 "score": best_score,
-                "path": entry.path
+                "reasons": best_reasons,
             })
         else:
             unmatched.append(dirname)
 
     print(json.dumps({
-        "matched": results,
+        "matched": matched,
+        "candidates": candidates,
         "unmatched": unmatched,
-        "totalMineru": len(results) + len(unmatched),
-        "matchedCount": len(results),
-        "unmatchedCount": len(unmatched)
+        "totalMineru": len(matched) + len(candidates) + len(unmatched),
+        "matchedCount": len(matched),
+        "candidateCount": len(candidates),
+        "unmatchedCount": len(unmatched),
+        "note": (
+            "`matched` comes from recorded provenance. `candidates` are heuristic "
+            "directory-name matches (score >= " + str(MATCH_MIN_SCORE) + "); confirm each one "
+            "before treating it as the paper's markdown."
+        ),
+    }, ensure_ascii=False, indent=2))
+    conn.close()
+
+
+def cmd_mineru_adopt(item_id, dirname):
+    """Record provenance for an existing MinerU directory.
+
+    For markdown created before provenance recording existed. The caller asserts
+    that this directory came from this paper's PDF -- which is exactly the judgement
+    the automatic matcher must not make by itself.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT ia.path, i.key AS attachmentKey
+        FROM itemAttachments ia
+        JOIN items i ON i.itemID = ia.itemID
+        WHERE ia.parentItemID = ? AND ia.contentType = 'application/pdf'
+        LIMIT 1
+    """, (item_id,))
+    row = cursor.fetchone()
+    if not row:
+        print(json.dumps({"error": "No PDF attachment found", "itemID": item_id}, ensure_ascii=False))
+        conn.close()
+        return
+
+    pdf_path = resolve_attachment_path(row['path'], row['attachmentKey'])
+    if not pdf_path or not os.path.isfile(pdf_path):
+        print(json.dumps({"error": "PDF file not found on disk", "itemID": item_id, "path": row['path']}, ensure_ascii=False))
+        conn.close()
+        return
+
+    target_dir = dirname if os.path.isabs(dirname) else os.path.join(MINERU_DIR or '', dirname)
+    if not os.path.isdir(target_dir):
+        print(json.dumps({"error": "Target directory not found", "target": target_dir}, ensure_ascii=False))
+        conn.close()
+        return
+
+    md_files = sorted(f for f in os.listdir(target_dir) if f.endswith(".md"))
+    record = {
+        "schema": 1,
+        "pdf": {
+            "path": pdf_path,
+            "filename": os.path.basename(pdf_path),
+            "sizeBytes": os.path.getsize(pdf_path),
+            "sha256": sha256_file(pdf_path),
+        },
+        "markdown": {"file": md_files[0] if md_files else None, "qualityStatus": None},
+        "mineru": {"method": None, "backend": None, "condaEnv": None, "modelSource": None},
+        "adopted": True,
+        "generatedAtUtc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    out = os.path.join(target_dir, ".mineru-provenance.json")
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, ensure_ascii=False, indent=2)
+
+    print(json.dumps({
+        "itemID": item_id,
+        "pdfPath": pdf_path,
+        "target": target_dir,
+        "provenance": out,
+        "sha256": record["pdf"]["sha256"],
     }, ensure_ascii=False, indent=2))
     conn.close()
 
@@ -1122,6 +1396,8 @@ def main():
         cmd_mineru_find(int(sys.argv[2]))
     elif command == "mineru-list":
         cmd_mineru_list()
+    elif command == "mineru-adopt" and len(sys.argv) >= 4:
+        cmd_mineru_adopt(int(sys.argv[2]), sys.argv[3])
     elif command == "export" and len(sys.argv) >= 3:
         fmt = "json"
         if "--format" in sys.argv:
@@ -1136,4 +1412,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as error:
+        # Our own diagnostic errors (missing library, locked library) read better as
+        # JSON than as a traceback, and the skill asks callers to report them verbatim.
+        print(json.dumps({"error": str(error)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        sys.exit(1)

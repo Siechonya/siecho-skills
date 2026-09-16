@@ -41,11 +41,17 @@ JUPYTEXT --set-formats ipynb,py:percent <file>.ipynb
 
 This creates `<file>.py` and writes Jupytext pairing metadata into the notebook.
 
-2. Before editing, pull notebook-side changes into the script:
+2. Sync before editing — but note what `--sync` actually does: it takes its **input from
+whichever paired file was modified last**. The extension you pass does not choose the
+direction. Check which side is newer before running it:
 
 ```powershell
-JUPYTEXT --sync <file>.ipynb
+Get-Item <file>.ipynb, <file>.py | Select-Object Name, LastWriteTime
+JUPYTEXT --sync <file>.py
 ```
+
+If **both** sides changed since the last sync, do not sync: diff them and merge the intended
+change by hand first, otherwise the newer file silently overwrites the other side's edits.
 
 3. Edit `<file>.py`. Cell boundaries are `# %%` for code and `# %% [markdown]` for markdown.
 
@@ -54,6 +60,8 @@ JUPYTEXT --sync <file>.ipynb
 ```powershell
 JUPYTEXT --sync <file>.py
 ```
+
+This is only safe while the script is the newer of the two files — same rule as step 2.
 
 If Jupytext says `--update` is needed to preserve outputs and cell IDs:
 
@@ -72,6 +80,8 @@ python -c "import json; json.load(open('<file>.ipynb', encoding='utf-8')); print
 - Use context-rich patches on `.py`; include nearby lines so the target is unambiguous.
 - Avoid broad replacements of short strings such as `[]`, `:`, `#`, `# %%`, `df`, or bare
   identifiers — `# %%` appears on every cell boundary.
+- `--sync` never asks which side wins: it reads the newer file. Establish which side changed
+  before syncing, and prefer an explicit diff when both did.
 - Keep edits inside the intended cell unless the user explicitly asks for broader changes.
 - If an edit target is not found, reread the area: the paired file may have changed after a
   sync or a formatter run.
@@ -83,8 +93,8 @@ python -c "import json; json.load(open('<file>.ipynb', encoding='utf-8')); print
 | Task | Command |
 | --- | --- |
 | First-time pairing | `JUPYTEXT --set-formats ipynb,py:percent <file>.ipynb` |
-| Pull notebook to script | `JUPYTEXT --sync <file>.ipynb` |
-| Push script to notebook | `JUPYTEXT --sync <file>.py` |
+| Sync (direction follows the newer file) | `JUPYTEXT --sync <file>.ipynb` or `<file>.py` |
+| See which side is newer | `Get-Item <file>.ipynb, <file>.py \| Select-Object Name, LastWriteTime` |
 | Push preserving outputs and IDs | `JUPYTEXT --to ipynb --update --output <file>.ipynb <file>.py` |
 | Force notebook from script | `JUPYTEXT --to ipynb <file>.py` |
 

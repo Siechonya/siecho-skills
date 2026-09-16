@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -76,24 +78,28 @@ def quality_check(md_path: Path) -> dict:
         if len(contexts) >= 5:
             break
 
+    # Verdicts only ever escalate: pass -> warn -> fail. A later check must never
+    # soften an earlier one (a 100-char stub with one mojibake rune is still a fail).
+    severity = {"pass": 0, "warn": 1, "fail": 2}
     status = "pass"
     reasons = []
+
+    def escalate(level, reason):
+        nonlocal status
+        reasons.append(reason)
+        if severity[level] > severity[status]:
+            status = level
+
     if chars < 200:
-        status = "fail"
-        reasons.append("markdown is too short")
+        escalate("fail", "markdown is too short")
     if replacement > 0 or mojibake_ratio > 0.02:
-        status = "fail"
-        reasons.append("too many replacement/mojibake characters")
+        escalate("fail", "too many replacement/mojibake characters")
     elif mojibake_hits > 0:
-        status = "warn"
-        reasons.append("possible OCR or mojibake artifacts found")
+        escalate("warn", "possible OCR or mojibake artifacts found")
     if long_word_ratio > 0.02:
-        if status == "pass":
-            status = "warn"
-        reasons.append("many unusually long alphabetic tokens; OCR may have joined adjacent words")
+        escalate("warn", "many unusually long alphabetic tokens; OCR may have joined adjacent words")
     if chars >= 500 and alpha_ratio < 0.20:
-        status = "fail"
-        reasons.append("low alphabetic text ratio")
+        escalate("fail", "low alphabetic text ratio")
 
     return {
         "path": str(md_path),
@@ -185,6 +191,44 @@ def find_generated_md(stage_dir: Path) -> Path:
     return candidates[0]
 
 
+def sha256_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    """Streaming SHA-256 of a file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def write_provenance(target_md: Path, pdf_path: Path, args: argparse.Namespace, quality: dict) -> Path:
+    """Record which PDF produced this markdown, so lookups can be exact.
+
+    Zotero's bridge matches a paper to its markdown by this record first; without
+    it the only thing left is guessing from directory names, which produced false
+    positives. Keep the file next to the markdown.
+    """
+    record = {
+        "schema": 1,
+        "pdf": {
+            "path": str(pdf_path),
+            "filename": pdf_path.name,
+            "sizeBytes": pdf_path.stat().st_size,
+            "sha256": sha256_file(pdf_path),
+        },
+        "markdown": {"file": target_md.name, "qualityStatus": quality.get("status")},
+        "mineru": {
+            "method": args.method,
+            "backend": args.backend,
+            "condaEnv": args.conda_env or None,
+            "modelSource": args.model_source or None,
+        },
+        "generatedAtUtc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    provenance = target_md.parent / ".mineru-provenance.json"
+    provenance.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    return provenance
+
+
 def copy_output(generated_md: Path, output_root: Path, paper_name: str, overwrite: bool) -> Path:
     existing_exact_dir = output_root / paper_name
     target_dir = existing_exact_dir if existing_exact_dir.is_dir() else output_root / sanitize_name(paper_name)
@@ -245,7 +289,7 @@ def convert_single(args: argparse.Namespace) -> dict:
     pdf_path = args.pdf.resolve()
     if not pdf_path.is_file():
         raise FileNotFoundError(pdf_path)
-    if args.virtual_vram_gb <= 0:
+    if args.virtual_vram_gb is not None and args.virtual_vram_gb <= 0:
         raise ValueError("--virtual-vram-gb must be a positive integer")
 
     paper_name = args.paper_name or pdf_path.stem
@@ -257,6 +301,7 @@ def convert_single(args: argparse.Namespace) -> dict:
         generated_md = find_generated_md(stage_dir)
         target_md = copy_output(generated_md, args.output_root, paper_name, args.overwrite)
         output_quality = quality_check(target_md)
+        provenance_path = write_provenance(target_md, pdf_path, args, output_quality)
         result = {
             "status": output_quality["status"],
             "method": args.method,
@@ -268,6 +313,7 @@ def convert_single(args: argparse.Namespace) -> dict:
             "outputRoot": str(args.output_root),
             "stageDir": str(stage_dir),
             "quality": output_quality,
+            "provenance": str(provenance_path),
             "notes": [
                 "If status is warn/fail, inspect sampleBadContexts and rerun with --method ocr or --method txt as appropriate."
             ],
@@ -295,29 +341,14 @@ def batch_convert(args: argparse.Namespace) -> int:
     for i, pdf_path in enumerate(pdf_files, 1):
         print(f"\r[{i}/{len(pdf_files)}] {pdf_path.name}...", file=sys.stderr, end="", flush=True)
         try:
-            # Build a mini-args for this single PDF
-            single_args = argparse.Namespace(
-                pdf=pdf_path,
-                check_md=None,
-                batch=None,
-                pattern=args.pattern,
-                continue_on_error=args.continue_on_error,
-                method=args.method,
-                paper_name=None,
-                output_root=args.output_root,
-                stage_root=args.stage_root,
-                hf_home=args.hf_home,
-                modelscope_cache=args.modelscope_cache,
-                torch_home=args.torch_home,
-                conda_env=args.conda_env,
-                backend=args.backend,
-                virtual_vram_gb=args.virtual_vram_gb,
-                lang=args.lang,
-                start=args.start,
-                end=args.end,
-                overwrite=args.overwrite,
-                keep_stage=args.keep_stage,
-            )
+            # Copy the parsed options and override only the per-file fields.
+            # Rebuilding the namespace by hand silently dropped every flag added
+            # after it was written (model_source, mineru_cmd, ...).
+            single_args = argparse.Namespace(**vars(args))
+            single_args.pdf = pdf_path
+            single_args.check_md = None
+            single_args.batch = None
+            single_args.paper_name = None
             single_result = convert_single(single_args)
             results.append(single_result)
             summary[single_result["status"]] += 1

@@ -45,6 +45,32 @@ creates and repoints links and cleans up dead ones without ever deleting a real 
 - **Windows-verified** (directory junctions, no admin rights). macOS/Linux are explicitly
   marked untested.
 
+## Status
+
+The instructions are the usable part; treat the scripts as young.
+
+- The three `SKILL.md` files are the deliberately small surface: they say which workflow to run
+  and when, and they state their own limits.
+- The `zotero` scripts were reviewed after the first release and several real defects were
+  fixed: quality verdicts could soften a failure, `storage:` paths missed the attachment key,
+  and a bare same-year match could be reported as a confident answer. Regression tests now
+  cover those cases.
+- That chain has still **not** been exercised end to end on a Zotero + MinerU installation
+  other than the author's. Read each skill's *Feasibility Notes* before depending on it, and
+  do not treat script output as authoritative for anything you would have to defend.
+
+## Testing
+
+```bash
+python -m unittest discover -s tests -v     # stdlib only; no Zotero or MinerU required
+```
+
+Covers the failure modes that have actually occurred: quality-verdict escalation, MinerU match
+scoring (a bare year must not match), `storage:` path resolution under the attachment key,
+provenance round-tripping, batch argument propagation, BibTeX author/entry-type handling, and
+the skill-sync script leaving a private skill alone when its name collides with the canonical
+set. Point the suite at another checkout with `ZOTERO_SCRIPTS_DIR` / `SYNC_SKILLS_SCRIPT`.
+
 ## Install
 
 Skills are plain folders — "installing" one means putting it where your agent looks for

@@ -95,6 +95,14 @@ foreach ($entry in $PerSkillRoots) {
 
   $changed = 0
   foreach ($name in $names) {
+    if ($keep -contains $name) {
+      # A canonical skill that shares a name with this entry's private skill: ownership is
+      # ambiguous, so touch nothing and let the operator decide. Linking it anyway replaced
+      # the private directory.
+      $script:warnings++
+      Write-Warning "canonical skill '$name' collides with a private Keep entry; left untouched"
+      continue
+    }
     $action = Resolve-Link (Join-Path $root $name) (Join-Path $Canonical $name)
     if ($action -in 'created', 'repointed') { $changed++ }
   }

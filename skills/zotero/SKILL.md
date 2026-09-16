@@ -1,6 +1,6 @@
 ---
 name: zotero
-description: Search and read a local Zotero reference library, generate citations, and convert Zotero PDFs into quality-checked MinerU markdown. Use when the user asks about their Zotero library, saved papers, references, bibliography, literature review over their own collection, paper metadata, authors, abstracts, PDFs, PDF full-text search, notes, annotations, APA/BibTeX citation or reference export, or when they ask to convert a PDF to markdown, create/find MinerU markdown, batch-convert a folder of PDFs, or quality-check an existing MinerU markdown file.
+description: Search and read a local Zotero reference library, produce citation drafts, and convert Zotero-held PDFs into MinerU markdown with a heuristic quality check. Use when the task concerns the user's own Zotero library or the PDFs stored in it - their saved papers, references, bibliography, literature review over their collection, paper metadata, authors, abstracts, PDF full-text search, notes, annotations, or citation/reference export from it - or when the user explicitly asks to convert a Zotero paper's PDF to markdown, find or create MinerU markdown for a Zotero paper, batch-convert Zotero PDFs, or quality-check existing MinerU output. Do not use it for generic PDF-to-Markdown conversion of files that are not in Zotero, and do not use it to format references the user has not stored in Zotero.
 ---
 
 # Zotero Library Integration
@@ -9,7 +9,7 @@ Read a local Zotero library through the bundled Python bridge, and turn Zotero P
 checked MinerU markdown with the second bundled script.
 
 The bridge handles Zotero's normalized schema, creator joins, field resolution, Unicode
-output, `storage:` attachment paths, PDF full-text indexes, and MinerU markdown matching.
+output, `storage:` attachment paths, and PDF full-text indexes.
 
 ## Requirements
 
@@ -59,14 +59,16 @@ SQLite database directly unless the bridge cannot support the task.
 | `stats` | Library counts, years, item types, top authors, collections. |
 | `recent [--days N]` | Recently added or modified papers. |
 | `notes <id>` / `annotations <id>` | Zotero notes / PDF annotations. |
-| `cite <id>` | APA and BibTeX citations. |
+| `cite <id>` | Citation **draft** only: mapped BibTeX entry type and a full author list, but not publication-grade. |
 | `export <id> [--format json\|csl]` | Structured metadata export. |
-| `mineru-find <id>` / `mineru-list` | Find MinerU markdown for a paper / list all matches. |
+| `mineru-find <id>` | Look up a paper's MinerU markdown by recorded provenance. |
+| `mineru-list` | List MinerU output directories, split into provenance matches and heuristic candidates. |
+| `mineru-adopt <id> <dirname>` | Record provenance for markdown created before provenance existed. |
 
 ## MinerU Markdown Creation
 
 Use `<SKILL_DIR>/scripts/mineru_create_md.py` when `mineru-find <id>` finds nothing, or
-when the user asks to convert a PDF to markdown.
+when the user asks to convert one of their Zotero PDFs to markdown.
 
 The script shells out to the **MinerU CLI** and then quality-checks the markdown it
 produced. Modes:
@@ -102,8 +104,19 @@ process per PDF — so concurrent jobs cannot contend for GPU memory. Output is 
 summary with per-file `pass`, `warn`, `fail`, or `error`. It stops at the first failure
 unless `--continue-on-error` is set.
 
-Quality verdicts: `pass` is usable; `warn` is usable only after inspecting
-`sampleBadContexts`; `fail` is unusable — rerun with a different `--method`.
+Quality verdicts, read literally: `pass` means none of the checks found a problem — not that
+formulas, tables and page completeness were verified. `warn` means inspect `sampleBadContexts`
+before relying on it. `fail` means do not use it; rerun with a different `--method`.
+
+### Matching a paper to its markdown
+
+`mineru-find` is exact by default: it hashes the paper's PDF and looks for a
+`.mineru-provenance.json` written by `mineru_create_md.py`, so the answer is the markdown that
+came from that file. Markdown converted before provenance existed has none, so it is reported
+under `candidates` instead — ranked by directory-name similarity — and must be confirmed by
+reading it before anything from it is quoted. Record an existing directory explicitly with
+`mineru-adopt <itemID> <dirname>`, which is the point where a human asserts the pairing.
+A shared year is deliberately not enough to count as a match.
 
 ### How MinerU is invoked (and what you must provide)
 

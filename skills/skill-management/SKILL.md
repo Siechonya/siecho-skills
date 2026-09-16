@@ -99,7 +99,9 @@ use `ln -s` by hand — the script refuses to run there, and its logic is untest
    canonical source and produce two same-named skills.
 4. **Keep each agent's private skills on its own side**, listed in the script's `Keep`. Do
    not copy them into the canonical directory: they are agent-specific, and some ship with
-   the agent itself (Codex `.system/`, Claude plugin skills).
+   the agent itself (Codex `.system/`, Claude plugin skills). If a name appears in both the
+   canonical set and `Keep`, the script reports the collision and leaves the entry alone —
+   that is ambiguous ownership, and renaming one side is the only clean fix.
 5. **`name` should match the folder name.** Some agents key the skill by frontmatter `name`,
    others by folder; matching satisfies both. A deliberate exception used as a compatibility
    trigger is fine — document it.

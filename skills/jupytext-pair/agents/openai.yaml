@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jupytext Pair"
+  short_description: "Pair and sync Jupytext notebooks."
+  default_prompt: "Use $jupytext-pair to sync this notebook with its paired Python script."

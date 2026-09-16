@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Management"
+  short_description: "One canonical skill directory shared by every agent."
+  default_prompt: "Use $skill-management to add this skill to my canonical skill directory and sync it to every agent."

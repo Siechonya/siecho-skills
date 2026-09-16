@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zotero"
+  short_description: "Search Zotero and create checked MinerU markdown."
+  default_prompt: "Use $zotero to search my Zotero library for relevant papers."

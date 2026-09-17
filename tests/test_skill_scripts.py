@@ -115,9 +115,14 @@ class AttachmentPathTests(unittest.TestCase):
     def setUp(self):
         # resolve_attachment_path reads the module global, so point it at the fixture.
         self._saved_storage = bridge.STORAGE_PATH
+        self._saved_base = os.environ.get("ZOTERO_BASE_ATTACHMENT_PATH")
 
     def tearDown(self):
         bridge.STORAGE_PATH = self._saved_storage
+        if self._saved_base is None:
+            os.environ.pop("ZOTERO_BASE_ATTACHMENT_PATH", None)
+        else:
+            os.environ["ZOTERO_BASE_ATTACHMENT_PATH"] = self._saved_base
 
     def test_keyed_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,6 +157,37 @@ class AttachmentPathTests(unittest.TestCase):
             pdf = pathlib.Path(tmp) / "loose.pdf"
             pdf.write_bytes(b"%PDF-1.4")
             self.assertEqual(bridge.resolve_attachment_path(str(pdf), None), str(pdf))
+
+    def test_linked_attachment_resolves_under_base_path(self):
+        # `attachments:` links are relative to the base-attachment directory, not the
+        # storage directory. Treating them as absolute paths returned None for every
+        # linked PDF in a library, which then looked empty.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["ZOTERO_BASE_ATTACHMENT_PATH"] = tmp
+            folder = pathlib.Path(tmp) / "0 Reviews"
+            folder.mkdir()
+            pdf = folder / "paper.pdf"
+            pdf.write_bytes(b"%PDF-1.4")
+            self.assertEqual(
+                bridge.resolve_attachment_path("attachments:0 Reviews/paper.pdf", "KEY"),
+                str(pdf),
+            )
+
+    def test_linked_attachment_missing_file_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["ZOTERO_BASE_ATTACHMENT_PATH"] = tmp
+            self.assertIsNone(
+                bridge.resolve_attachment_path("attachments:absent.pdf", "KEY")
+            )
+
+    def test_linked_attachment_without_a_base_path_returns_none(self):
+        # No env override: the bridge falls back to prefs.js, and when that yields a
+        # directory this relative path does not exist in, the answer is still None
+        # rather than a fabricated path.
+        os.environ.pop("ZOTERO_BASE_ATTACHMENT_PATH", None)
+        self.assertIsNone(
+            bridge.resolve_attachment_path("attachments:definitely-absent-9f3.pdf", "KEY")
+        )
 
 
 class ProvenanceTests(unittest.TestCase):

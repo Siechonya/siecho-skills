@@ -9,7 +9,9 @@ Read a local Zotero library through the bundled Python bridge, and turn Zotero P
 checked MinerU markdown with the second bundled script.
 
 The bridge handles Zotero's normalized schema, creator joins, field resolution, Unicode
-output, `storage:` attachment paths, and PDF full-text indexes.
+output, and both attachment shapes (`storage:` items and `attachments:` linked files).
+Body search reads MinerU markdown rather than a full-text index - see *Body Search Reads
+MinerU, Not the Database* below.
 
 ## Requirements
 
@@ -21,6 +23,7 @@ Set the two required variables before running anything; the bridge reads them at
 | `ZOTERO_STORAGE` | recommended | Full path to the Zotero `storage` directory (resolves `storage:` attachment paths) |
 | `MINERU_OUTPUT_DIR` | for MinerU | Full path to the MinerU markdown output directory |
 | `ZOTERO_VAULT_ROOT` | optional | Library root; MinerU output defaults to `<root>/docs/mineru_output` |
+| `ZOTERO_BASE_ATTACHMENT_PATH` | for linked files | Root that `attachments:` linked files are relative to (Zotero's `extensions.zotero.baseAttachmentPath`). Read from Zotero's `prefs.js` when unset. |
 
 If `ZOTERO_DB` is unset the bridge tries the usual Zotero data-directory locations and then
 exits with a message telling you to set it. When Zotero's own auto-detection does not match
@@ -44,12 +47,21 @@ On PowerShell, always set `PYTHONIOENCODING=utf-8` so non-ASCII titles survive.
 Replace `<SKILL_DIR>` with the absolute path to this skill folder. Do not query the Zotero
 SQLite database directly unless the bridge cannot support the task.
 
+**The bridge works with Zotero open.** It tries the live library first and, when a running
+Zotero holds the rollback-journal lock, falls back to reading a snapshot copy taken at call
+time. Results say which happened under `databaseSource` (`live` or `snapshot`); `snapshot`
+metadata can lag Zotero by the moments between the copy and the read. Do not tell the user
+to close Zotero as a first move.
+
+Both attachment shapes must resolve or the library looks empty: `storage:<name>` under the
+data directory, and `attachments:<relative path>` under the base-attachment directory.
+
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `search "<query>"` | Search title and abstract; ranked papers with itemID, title, authors, year, snippets. |
-| `fulltext-search "<query>"` | Search Zotero's indexed PDF full text. |
+| `fulltext-search "<query>"` | Search paper **bodies** and return matching papers with snippets. Reads MinerU markdown, not a database index - see below. |
 | `search-by-author "<name>"` | Find papers by author first or last name. |
 | `get-paper <id>` | Full metadata, collections, attachments, notes, annotations. |
 | `list-collections` | List collections with paper counts. |
@@ -64,6 +76,30 @@ SQLite database directly unless the bridge cannot support the task.
 | `mineru-find <id>` | Look up a paper's MinerU markdown by recorded provenance. |
 | `mineru-list` | List MinerU output directories, split into provenance matches and heuristic candidates. |
 | `mineru-adopt <id> <dirname>` | Record provenance for markdown created before provenance existed. |
+
+## Body Search Reads MinerU, Not the Database
+
+`fulltext-search` answers "what does this paper actually say", so it reads the MinerU
+markdown - the curated, quality-checked text of that PDF. It deliberately does **not** lean
+on Zotero's own full-text word index, which is coarser, carries no context, and is not even
+present in every library.
+
+Order of preference, and what each result reports:
+
+| `source` | Meaning |
+| --- | --- |
+| `mineru` | Pairing backed by recorded provenance (the PDF SHA-256 written at conversion). Authoritative. |
+| `mineru-candidate` | Paper and markdown matched by directory-name similarity only. Confirm before quoting, or promote with `mineru-adopt`. |
+| `zotero-index` | No MinerU markdown exists for this paper, so Zotero's word index was consulted. Coarser, no snippets. |
+
+The reply counts each bucket (`searchedMineruBodies`, `mineruMatches`, `zoteroIndexOnlyMatches`)
+and sets `zoteroIndexAvailable`. When that flag is `false` the library has no
+`fulltextWords`/`fulltextItemWords` tables at all, which is normal on Zotero 7 - there is
+then no index fallback, and that is a fact to report rather than an error to work around.
+
+A paper is reported once, from its strongest source. Markdown converted before provenance
+existed shows up as `mineru-candidate`; run `mineru-adopt <itemID> "<dirname>"` for each
+verified pairing to make it `mineru` from then on.
 
 ## MinerU Markdown Creation
 
@@ -164,7 +200,7 @@ result — install MinerU first, or skip the conversion commands and use the bri
 ## Common Workflows
 
 - "Search my Zotero for X" → `search "X"`, then show a concise numbered list with itemIDs.
-- "Search inside my PDFs for X" → `fulltext-search "X"`; title/abstract search is not enough.
+- "Search inside my PDFs for X" → `fulltext-search "X"`; title/abstract search is not enough. It reads MinerU markdown, so it returns real snippets of the curated text instead of word-index hits with no context.
 - Author questions → `search-by-author "<name>"`.
 - Details about paper `N` → `get-paper N`; summarize title, authors, year, venue, DOI,
   abstract, PDF availability, notes, annotations.
@@ -187,6 +223,12 @@ result — install MinerU first, or skip the conversion commands and use the bri
 - Batch broad discovery before deep `get-paper` calls.
 - Prefer `fulltext-search` for methods, equations, findings, or concepts that appear only
   in paper bodies.
+- `fulltext-search` results carry `source` and `pairingConfidence`. `mineru` means recorded
+  provenance backs the pairing; `mineru-candidate` means directory-name similarity, which
+  **must be confirmed before quoting**. Promote a verified pairing with
+  `mineru-adopt <itemID> "<dirname>"` so later searches return it as `mineru`.
+- When `zoteroIndexAvailable` is `false`, say so plainly: the library has no Zotero word
+  index, so body search has no fallback and that is a fact about the library, not an error.
 - If a command finds nothing, report the exact command and the bridge error/absence.
 - For deep reading, prefer `mineru-find` plus reading the markdown over raw PDF.
 - Always check the quality verdict before presenting MinerU content; never summarize a

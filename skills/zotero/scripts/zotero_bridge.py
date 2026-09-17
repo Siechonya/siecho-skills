@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Zotero Bridge - Codex integration with local Zotero library.
-Reads directly from the Zotero SQLite database for fast, offline access.
+Reads the Zotero SQLite database for fast, offline access. When a running Zotero holds
+the library, it reads a snapshot copy instead, so the bridge works with Zotero open.
 
 Usage:
   python zotero_bridge.py search "<keywords>"              # Search papers by title/abstract
@@ -16,7 +17,7 @@ Usage:
   python zotero_bridge.py annotations <itemID>            # Get PDF annotations for a paper
   python zotero_bridge.py cite <itemID>                   # Generate citation from metadata
   python zotero_bridge.py export <itemID> [--format json|csl|bibtex]
-  python zotero_bridge.py fulltext-search "<query>"       # Search inside PDF full-text content
+  python zotero_bridge.py fulltext-search "<query>"       # Search paper bodies (MinerU markdown first)
   python zotero_bridge.py search-by-author "<name>"       # Search papers by author name
   python zotero_bridge.py list-tags                       # List all tags with counts
   python zotero_bridge.py mineru-find <itemID>            # Find MinerU markdown for a paper
@@ -24,12 +25,16 @@ Usage:
   python zotero_bridge.py mineru-adopt <itemID> <dirname> # Record provenance for existing markdown
 """
 
+import atexit
+import glob
 import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timedelta
 
 # Force UTF-8 output to handle Unicode characters in paper titles
@@ -113,6 +118,9 @@ def find_zotero_storage():
 #   ZOTERO_STORAGE      full path to the Zotero "storage" directory
 #   MINERU_OUTPUT_DIR   full path to the MinerU markdown output directory
 #   ZOTERO_VAULT_ROOT   library root; MinerU output defaults to <root>/docs/mineru_output
+#   ZOTERO_BASE_ATTACHMENT_PATH
+#                       root that `attachments:` linked files are relative to. Read from
+#                       Zotero's prefs.js (extensions.zotero.baseAttachmentPath) when unset.
 DB_PATH = find_zotero_db() or os.environ.get("ZOTERO_DB")
 STORAGE_PATH = find_zotero_storage() or os.environ.get("ZOTERO_STORAGE")
 MINERU_DIR = find_mineru_dir() or os.environ.get("MINERU_OUTPUT_DIR")
@@ -167,24 +175,110 @@ RESEARCH_TYPES = [
 ]
 
 
-def get_db():
-    """Get a read-only database connection with row factory."""
-    path = resolve_db_path()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=15.0)
+_DB_SOURCE = {"mode": "live", "path": None, "snapshotDir": None}
+
+
+def _cleanup_snapshot():
+    """Delete the snapshot copy, if one was taken."""
+    directory = _DB_SOURCE.get("snapshotDir")
+    if directory:
+        shutil.rmtree(directory, ignore_errors=True)
+        _DB_SOURCE["snapshotDir"] = None
+
+
+atexit.register(_cleanup_snapshot)
+
+
+def db_source_note():
+    """What the last get_db() read, so a caller can say so next to its results."""
+    if _DB_SOURCE["mode"] == "snapshot":
+        return {
+            "mode": "snapshot",
+            "note": (
+                "The live library was held by a running Zotero, so this ran against a "
+                "snapshot copy taken at call time. Metadata can lag Zotero by the moments "
+                "between the copy and the read."
+            ),
+        }
+    return {"mode": "live"}
+
+
+def _open_readonly(path, timeout):
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
     conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _probe_library(conn):
+    conn.execute("SELECT 1 FROM itemTypes LIMIT 1").fetchone()
+
+
+def snapshot_db(path):
+    """Copy the library and its journal sidecars so a running Zotero cannot block us.
+
+    Zotero uses a rollback journal, so `zotero.sqlite-journal` can hold the pages of an
+    in-flight write; copying it next to the snapshot keeps the copy readable instead of
+    hot. -wal/-shm are copied too in case a future Zotero switches journal mode.
+    """
+    directory = tempfile.mkdtemp(prefix="zbridge-")
+    destination = os.path.join(directory, os.path.basename(path))
+    shutil.copy2(path, destination)
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = path + suffix
+        if os.path.exists(sidecar):
+            try:
+                shutil.copy2(sidecar, destination + suffix)
+            except OSError:
+                pass
+    return destination
+
+
+def get_db():
+    """Read-only connection to the library that survives a running Zotero.
+
+    The live file is tried first and only briefly: `mode=ro` is enough while Zotero is
+    idle, so the common case stays cheap. A library held open by Zotero raises
+    SQLITE_BUSY here, and that is exactly when this falls back to a snapshot copy
+    instead of failing and telling the user to close Zotero, which is not a reasonable
+    thing to ask of the normal case.
+    """
+    path = resolve_db_path()
+    conn = None
     try:
-        # Probe here: a library locked by a running Zotero fails at this point, which is
-        # the one place that can explain it, instead of SQLITE_BUSY surfacing from inside
-        # whichever command the caller ran.
-        conn.execute("SELECT 1 FROM itemTypes LIMIT 1").fetchone()
+        conn = _open_readonly(path, timeout=1.0)
+        _probe_library(conn)
+    except sqlite3.OperationalError:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+    else:
+        _DB_SOURCE.update(mode="live", path=path, snapshotDir=None)
+        return conn
+
+    try:
+        snapshot = snapshot_db(path)
+    except OSError as error:
+        raise RuntimeError(
+            f"could not read the Zotero library at {path}: {error}. The library is "
+            "locked by a running Zotero and the snapshot copy failed too."
+        ) from error
+
+    _cleanup_snapshot()
+    _DB_SOURCE["snapshotDir"] = os.path.dirname(snapshot)
+    conn = _open_readonly(snapshot, timeout=15.0)
+    try:
+        _probe_library(conn)
     except sqlite3.OperationalError as error:
         conn.close()
+        _cleanup_snapshot()
         raise RuntimeError(
-            f"could not read the Zotero library at {path}: {error}. "
-            "Zotero keeps its library in a rollback-journal SQLite file, so a running "
-            "Zotero (or an unfinished sync) blocks readers. Close Zotero and retry, or "
-            "point ZOTERO_DB at a copy of the library."
+            f"could not read the Zotero library at {path}: {error}. Neither the live file "
+            "nor a snapshot copy could be read - an unfinished Zotero sync can do this, "
+            "so let Zotero finish starting up and retry."
         ) from error
+    _DB_SOURCE.update(mode="snapshot", path=path)
     return conn
 
 
@@ -506,16 +600,86 @@ TITLE_STOPWORDS = {
 }
 
 
+def prefs_candidates():
+    """Zotero `prefs.js` locations, newest first."""
+    patterns = []
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        patterns.append(os.path.join(appdata, "Zotero", "Zotero", "Profiles", "*", "prefs.js"))
+        patterns.append(os.path.join(appdata, "Zotero", "Zotero", "*", "prefs.js"))
+    patterns.append(os.path.expanduser("~/.zotero/zotero/*/prefs.js"))
+    found = []
+    for pattern in patterns:
+        found.extend(glob.glob(pattern))
+    found.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+    return found
+
+
+def read_zotero_prefs():
+    """Loosely parse the newest readable prefs.js into a plain dict."""
+    for prefs_path in prefs_candidates():
+        prefs = {}
+        try:
+            with open(prefs_path, encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line.startswith("user_pref("):
+                        continue
+                    body = line[len("user_pref("):].rstrip(";").rstrip(")")
+                    key, _, value = body.partition(",")
+                    key = key.strip().strip('"')
+                    value = value.strip()
+                    if value.startswith('"') and value.endswith('"'):
+                        # Windows paths are stored with doubled backslashes.
+                        value = value[1:-1].replace("\\\\", "\\").replace('\\"', '"')
+                    prefs[key] = value
+        except OSError:
+            continue
+        if prefs:
+            return prefs
+    return {}
+
+
+def find_base_attachment_path():
+    """`extensions.zotero.baseAttachmentPath` - the root of `attachments:` links.
+
+    Linked files (`linkMode = 2`) store "attachments:<relative>" and every machine
+    resolves that against its own base directory, so this must be read rather than
+    assumed. Set ZOTERO_BASE_ATTACHMENT_PATH to override. When neither that nor
+    prefs.js yields one, linked attachments cannot be resolved at all and callers
+    see them as missing - that is a configuration gap to report, not a bug to paper
+    over.
+    """
+    override = os.environ.get("ZOTERO_BASE_ATTACHMENT_PATH")
+    if override:
+        return override
+    return read_zotero_prefs().get("extensions.zotero.baseAttachmentPath")
+
+
 def resolve_attachment_path(path, attachment_key):
     """Resolve one attachment row's `path` to a real filesystem path.
 
-    A Zotero `storage:name.pdf` value lives at <storage>/<attachment key>/name.pdf.
-    The flat <storage>/name.pdf layout only exists in very old libraries, so it is
-    tried second.
+    Three shapes exist: `storage:name.pdf` lives at <storage>/<attachment key>/name.pdf
+    (the flat <storage>/name.pdf layout only exists in very old libraries),
+    `attachments:relative/path.pdf` is a linked file under
+    `extensions.zotero.baseAttachmentPath`, and anything else is an absolute path.
+    The `attachments:` case used to fall through to the absolute-path branch and
+    return None, which made every linked PDF in a library unresolvable - and took
+    MinerU pairing down with it.
     """
     if not path:
         return None
     path = str(path)
+
+    if path.startswith("attachments:"):
+        base = find_base_attachment_path()
+        if not base:
+            return None
+        relative = path.replace("attachments:", "", 1)
+        relative = relative.replace("\\", "/").lstrip("/")
+        candidate = os.path.join(base, *relative.split("/"))
+        return candidate if os.path.exists(candidate) else None
+
     if not path.startswith("storage:"):
         return path if os.path.exists(path) else None
 
@@ -999,64 +1163,217 @@ def cmd_export(item_id, fmt='json'):
     conn.close()
 
 
+def _zotero_word_index_available(cursor):
+    """Whether this library actually carries Zotero's word-level fulltext tables.
+
+    A Zotero 7 database can hold `fulltextItems` (page counts) without the
+    `fulltextWords`/`fulltextItemWords` pair that a word search needs. Querying them
+    unguarded used to abort the whole command.
+    """
+    cursor.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('fulltextWords', 'fulltextItemWords')"
+    )
+    return cursor.fetchone()[0] == 2
+
+
+def _markdown_in_directory(directory):
+    """The markdown a MinerU output directory holds, choosing the largest .md."""
+    try:
+        entries = [
+            entry for entry in os.scandir(directory)
+            if entry.is_file() and entry.name.lower().endswith(".md")
+        ]
+    except OSError:
+        return None
+    if not entries:
+        return None
+    entries.sort(key=lambda entry: entry.stat().st_size, reverse=True)
+    return entries[0].path
+
+
+def _mineru_item_index(cursor, min_candidate_score=10):
+    """itemID -> MinerU markdown, split by how firmly the pairing is known.
+
+    `provenance` entries are exact: the PDF's SHA-256 was recorded when the markdown
+    was produced. `candidate` entries are name-similarity guesses, which is all that can
+    be said for markdown converted before provenance existed - they are kept because a
+    library can otherwise look like it has no MinerU output at all, but each one is
+    labelled so a caller never quotes a guess as if it were verified.
+    """
+    attachments = _library_pdf_attachments(cursor, RESEARCH_TYPES)
+    index = {}
+    claimed_dirs = set()
+
+    for record in provenance_records():
+        if not record["markdownExists"]:
+            continue
+        attachment = associate_record_with_library(record, attachments)
+        if attachment is None:
+            continue
+        item_id = attachment["itemID"]
+        if item_id in index:
+            continue
+        index[item_id] = {
+            "markdownFile": record["markdownFile"],
+            "confidence": "provenance",
+            "score": None,
+            "dirname": record["dirname"],
+            "qualityStatus": record["qualityStatus"],
+        }
+        claimed_dirs.add(record["dirname"])
+
+    for attachment in attachments:
+        item_id = attachment["itemID"]
+        if item_id in index:
+            continue
+        fields = get_item_fields(cursor, item_id, ['title', 'date'])
+        title = fields.get('title', '') or ''
+        year = str(fields.get('date', ''))[:4] if fields.get('date') else ''
+        stem = os.path.splitext(os.path.basename(attachment["path"]))[0]
+        ranked = rank_mineru_candidates(title, year, stem, limit=1)
+        if not ranked:
+            continue
+        best = ranked[0]
+        if best.get("score", 0) < min_candidate_score:
+            continue
+        if best.get("dirname") in claimed_dirs:
+            continue
+        markdown = best.get("markdownFile") or _markdown_in_directory(best.get("directory") or "")
+        if not markdown:
+            continue
+        index[item_id] = {
+            "markdownFile": markdown,
+            "confidence": "candidate",
+            "score": best.get("score"),
+            "dirname": best.get("dirname"),
+            "qualityStatus": None,
+        }
+        claimed_dirs.add(best.get("dirname"))
+    return index
+
+
+def _markdown_body_hits(markdown_path, terms, max_snippets=3):
+    """Case-insensitive term search over one MinerU markdown file.
+
+    Returns None unless every term occurs at least once, so the caller keeps all-terms
+    semantics rather than OR-ing terms together silently.
+    """
+    try:
+        with open(markdown_path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    lowered = text.lower()
+    counts = {term: lowered.count(term) for term in terms}
+    if any(count == 0 for count in counts.values()):
+        return None
+    snippets = []
+    for term in terms:
+        start = 0
+        while len(snippets) < max_snippets:
+            position = lowered.find(term, start)
+            if position < 0:
+                break
+            left = max(0, position - 70)
+            right = min(len(text), position + len(term) + 70)
+            snippet = re.sub(r"\s+", " ", text[left:right]).strip()
+            if snippet not in snippets:
+                snippets.append(snippet)
+            start = position + len(term)
+    return {"counts": counts, "totalMatches": sum(counts.values()), "snippets": snippets}
+
+
 def cmd_fulltext_search(query):
-    """Search inside PDF full-text content using Zotero's indexed words."""
+    """Search paper bodies: MinerU markdown first, Zotero's word index only as backup.
+
+    MinerU markdown is the body text a library actually curates - produced from the
+    PDF, quality-checked, and tied to it by provenance - so it is the authoritative
+    source for methods, equations and findings. Zotero's own word index is a coarser
+    artifact, so it is consulted only for papers that have no MinerU markdown, and every
+    result says which of the two it came from. A paper is never reported twice, and a
+    MinerU-backed match is never silently replaced by an index-only one.
+    """
+    terms = [w.lower().strip() for w in query.split() if len(w.strip()) >= 2]
+
+    if not terms:
+        print(json.dumps({"count": 0, "results": [], "query": query, "error": "Query too short"}))
+        return
+
     conn = get_db()
     cursor = conn.cursor()
-
-    search_words = [w.lower().strip() for w in query.split() if len(w.strip()) >= 2]
-
-    if not search_words:
-        print(json.dumps({"count": 0, "results": [], "query": query, "error": "Query too short"}))
-        conn.close()
-        return
-
-    # Find itemIDs that contain ALL search words in their fulltext
-    word_placeholders = ','.join(['?'] * len(search_words))
-    cursor.execute(f"""
-        SELECT fiw.itemID, COUNT(DISTINCT fw.wordID) as word_matches
-        FROM fulltextItemWords fiw
-        JOIN fulltextWords fw ON fiw.wordID = fw.wordID
-        WHERE LOWER(fw.word) IN ({word_placeholders})
-        GROUP BY fiw.itemID
-        HAVING COUNT(DISTINCT LOWER(fw.word)) >= ?
-        ORDER BY word_matches DESC
-        LIMIT 20
-    """, search_words + [len(search_words)])
-
-    item_matches = {row['itemID']: row['word_matches'] for row in cursor.fetchall()}
-
-    if not item_matches:
-        print(json.dumps({"count": 0, "results": [], "query": query}))
-        conn.close()
-        return
-
-    # Now get parent items (papers) for these fulltext itemIDs
-    # fulltextItems.itemID refers to attachment items; we need their parents
     results = []
-    for ft_item_id, word_count in item_matches.items():
-        # Check if this is an attachment - find the parent paper
-        cursor.execute("""
-            SELECT parentItemID FROM itemAttachments WHERE itemID = ?
-        """, (ft_item_id,))
+
+    # ---- 1) MinerU markdown: the authoritative body text ----
+    mineru_index = _mineru_item_index(cursor)
+    for item_id, record in mineru_index.items():
+        hit = _markdown_body_hits(record["markdownFile"], terms)
+        if not hit:
+            continue
+        fields = get_item_fields(cursor, item_id, ['title', 'date', 'publicationTitle', 'DOI'])
+        creators = get_creators(cursor, item_id)
+        entry = {
+            "itemID": item_id,
+            "title": fields.get('title', 'N/A'),
+            "year": str(fields.get('date', ''))[:4] if fields.get('date') else 'N/A',
+            "authors": format_authors(creators),
+            "publication": fields.get('publicationTitle', ''),
+            "doi": fields.get('DOI', ''),
+            "source": "mineru" if record["confidence"] == "provenance" else "mineru-candidate",
+            "pairingConfidence": record["confidence"],
+            "matchCount": hit["totalMatches"],
+            "termCounts": hit["counts"],
+            "snippets": hit["snippets"],
+            "markdownPath": record["markdownFile"],
+            "mineruDirname": record["dirname"],
+            "qualityStatus": record["qualityStatus"],
+        }
+        if record["confidence"] == "candidate":
+            entry["pairingNote"] = (
+                "This markdown was matched to the paper by directory-name similarity "
+                "(score %s), not by recorded provenance, so confirm it is the right "
+                "paper - or promote it with `mineru-adopt %d \"%s\"` - before quoting it."
+            ) % (record["score"], item_id, record["dirname"])
+        if record["qualityStatus"] == "fail":
+            entry["qualityWarning"] = (
+                "This markdown was graded fail when it was converted; do not quote it "
+                "without re-checking."
+            )
+        results.append(entry)
+
+    covered = set(mineru_index)
+    mineru_matches = len(results)
+
+    # ---- 2) Zotero's word index: only for papers with no MinerU markdown ----
+    index_available = _zotero_word_index_available(cursor)
+    index_rows = []
+    if index_available:
+        word_placeholders = ','.join(['?'] * len(terms))
+        cursor.execute(f"""
+            SELECT fiw.itemID, COUNT(DISTINCT fw.wordID) as word_matches
+            FROM fulltextItemWords fiw
+            JOIN fulltextWords fw ON fiw.wordID = fw.wordID
+            WHERE LOWER(fw.word) IN ({word_placeholders})
+            GROUP BY fiw.itemID
+            HAVING COUNT(DISTINCT LOWER(fw.word)) >= ?
+            ORDER BY word_matches DESC
+            LIMIT 20
+        """, terms + [len(terms)])
+        index_rows = cursor.fetchall()
+
+    index_only = 0
+    for row in index_rows:
+        ft_item_id = row['itemID']
+        cursor.execute("SELECT parentItemID FROM itemAttachments WHERE itemID = ?", (ft_item_id,))
         att_row = cursor.fetchone()
         paper_id = att_row['parentItemID'] if att_row else ft_item_id
-
-        if not paper_id:
+        if not paper_id or paper_id in covered:
             continue
-
-        # Get paper metadata
         item_type = get_item_type(cursor, paper_id)
         if item_type not in RESEARCH_TYPES and item_type != 'attachment':
             continue
-
-        fields = get_item_fields(cursor, paper_id, ['title', 'date', 'abstractNote', 'publicationTitle', 'DOI'])
+        fields = get_item_fields(cursor, paper_id, ['title', 'date', 'publicationTitle', 'DOI'])
         creators = get_creators(cursor, paper_id)
-
-        # Get fulltext info for this attachment
-        cursor.execute("SELECT indexedPages, totalPages FROM fulltextItems WHERE itemID = ?", (ft_item_id,))
-        ft_info = cursor.fetchone()
-
         results.append({
             "itemID": paper_id,
             "title": fields.get('title', 'N/A'),
@@ -1064,28 +1381,45 @@ def cmd_fulltext_search(query):
             "authors": format_authors(creators),
             "publication": fields.get('publicationTitle', ''),
             "doi": fields.get('DOI', ''),
-            "fulltextWordMatches": word_count,
-            "indexedPages": ft_info['indexedPages'] if ft_info else None,
-            "totalPages": ft_info['totalPages'] if ft_info else None
+            "source": "zotero-index",
+            "matchCount": row['word_matches'],
+            "note": (
+                "No MinerU markdown for this paper, so this matched Zotero's own PDF "
+                "word index. That index is coarser and carries no snippet."
+            ),
         })
+        index_only += 1
+        covered.add(paper_id)
 
-    # Deduplicate by paper ID
-    seen = set()
-    unique_results = []
-    for r in results:
-        if r['itemID'] not in seen:
-            seen.add(r['itemID'])
-            unique_results.append(r)
+    conn.close()
 
-    unique_results.sort(key=lambda x: x['fulltextWordMatches'], reverse=True)
+    results.sort(key=lambda r: (r["source"] != "mineru", -r["matchCount"]))
+
+    if index_available:
+        note = (
+            "Body search read MinerU markdown first (%d papers have one); it is the "
+            "authoritative body text. Zotero's own PDF word index was consulted only for "
+            "papers without MinerU output, and those results carry "
+            "source=\"zotero-index\"."
+        ) % len(mineru_index)
+    else:
+        note = (
+            "Body search read MinerU markdown only: %d papers have one. This library has "
+            "no Zotero word index (fulltextWords/fulltextItemWords are absent from "
+            "zotero.sqlite), so there is no index fallback to fall back to."
+        ) % len(mineru_index)
 
     print(json.dumps({
-        "count": len(unique_results),
-        "results": unique_results,
+        "count": len(results),
         "query": query,
-        "note": "Searches inside PDF full-text content indexed by Zotero"
+        "searchedMineruBodies": len(mineru_index),
+        "mineruMatches": mineru_matches,
+        "zoteroIndexAvailable": index_available,
+        "zoteroIndexOnlyMatches": index_only,
+        "results": results,
+        "databaseSource": db_source_note(),
+        "note": note,
     }, ensure_ascii=False, indent=2))
-    conn.close()
 
 
 def cmd_list_tags():

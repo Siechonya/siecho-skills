@@ -1,10 +1,11 @@
 ﻿<#
   sync-skills.ps1 - propagate one canonical skill directory into several agents.
 
-  Edit the CONFIG block, then run:
+  Edit the CONFIG block, then run (powershell.exe ships with every Windows install;
+  pwsh works too if PowerShell 7 is available):
 
-    pwsh -File scripts/sync-skills.ps1 -DryRun
-    pwsh -File scripts/sync-skills.ps1
+    powershell -File scripts/sync-skills.ps1 -DryRun
+    powershell -File scripts/sync-skills.ps1
 
   Safety: this script only creates, repoints, and removes *links*. It never deletes a real
   directory. Entries listed in Keep are treated as that agent's private skills and are left

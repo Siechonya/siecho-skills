@@ -1,6 +1,6 @@
 ---
 name: skill-management
-description: Set up and maintain one canonical skill directory shared by several coding agents (Claude Code, Codex, OpenCode, DSH, Qoder, and similar). Use when the user wants to add, edit, rename, remove, install, or sync a skill across agents; when a skill is duplicated, missing, or stale in one agent; when skills live in several diverging copies; or when the user says "unified skills", "skill source of truth", "share skills between agents", or "sync my skills".
+description: Set up and maintain one canonical skill directory shared by several coding agents (Claude Code, Codex, OpenCode, DSH, Qoder, ZCode, and similar). Use when the user wants to add, edit, rename, remove, install, or sync a skill across agents; when a skill is duplicated, missing, or stale in one agent; when skills live in several diverging copies; or when the user says "unified skills", "skill source of truth", "share skills between agents", or "sync my skills".
 ---
 
 # Skill Management Across Agents
@@ -31,7 +31,8 @@ Other files in the folder (`scripts/`, `references/`, assets) are yours to use; 
 ## 2. Find where each agent reads skills
 
 Typical locations. **Confirm against your agent's version before trusting this table** —
-these move between releases, and only the first two were verified for this skill.
+these move between releases. Each row was verified on one Windows machine against one
+version of that agent; treat it as a starting point, not a guarantee for your install.
 
 | Agent | Skills directory | Notes |
 | --- | --- | --- |
@@ -41,6 +42,7 @@ these move between releases, and only the first two were verified for this skill
 | OpenCode | `~/.config/opencode/skill(s)` | Config key `skills.paths` can add more |
 | DSH | `~/.dsh/skills` and `~/.agents/skills` | Scanned together, so do not populate both (see below) |
 | Qoder | `~/.qoder-cn/skills` | |
+| ZCode | `~/.zcode/skills` | Also reads `~/.agents/skills` natively; its own directory shadows a same-named canonical skill (see below) |
 
 Search for the real thing rather than guessing:
 
@@ -71,7 +73,9 @@ skills need a re-run of the sync step.
 Either way, the link target is the canonical folder — so **the same skill must not be
 reachable through two different entry directories on one agent**. Where that happens (DSH
 scans `~/.dsh/skills` and `~/.agents/skills` in one pass), leave one side empty or the agent
-will collect every skill twice and warn about it.
+will collect every skill twice and warn about it. ZCode scans `~/.zcode/skills` and
+`~/.agents/skills` the same way, but resolves the clash silently: a same-named skill in
+`~/.zcode/skills` wins, so edits to the canonical copy appear to have no effect.
 
 ## 4. Keep it in sync
 
@@ -80,9 +84,12 @@ canonical directory. Edit its CONFIG block (canonical path, whole-link roots, pe
 roots, and each agent's `Keep` list of private skills), then:
 
 ```powershell
-pwsh -File scripts/sync-skills.ps1 -DryRun   # preview
-pwsh -File scripts/sync-skills.ps1           # apply
+powershell -File scripts/sync-skills.ps1 -DryRun   # preview
+powershell -File scripts/sync-skills.ps1           # apply
 ```
+
+`powershell.exe` (Windows PowerShell 5.1) exists on every Windows install, so it is the
+portable choice; `pwsh` (PowerShell 7) also runs the script.
 
 It creates missing links, repoints wrong ones, and removes links whose skill was deleted. It
 **never deletes a real directory**: anything real that it does not recognise is reported and
@@ -127,9 +134,12 @@ opencode debug skill
 
 ## Feasibility Notes
 
-- **Verified:** Windows, directory junctions (no administrator rights needed), and
-  PowerShell 7 for the sync script; the canonical-plus-links layout was exercised with
+- **Verified:** Windows, directory junctions (no administrator rights needed), and the sync
+  script under Windows PowerShell 5.1; the canonical-plus-links layout was exercised with
   several agents on one machine.
+- **Script runner:** `powershell.exe` is present on every Windows install, and `pwsh`
+  (PowerShell 7) also runs the script, which uses 5.1-compatible syntax. Only the 5.1
+  runner is covered by the verification above.
 - **Not verified:** macOS and Linux end to end (symlink behaviour, agent paths, the sync
   script); Windows without `cmd.exe` available to PowerShell; agents not listed above; and
   any agent version other than the ones tested. The table of entry paths is a starting
